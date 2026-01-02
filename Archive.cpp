@@ -27,6 +27,7 @@
 #include <cstring>
 #include <array>
 #include <cmath>
+#include <cctype>
 
 #include "CM-inl.hpp"
 #include "X86Binary.hpp"
@@ -804,8 +805,27 @@ uint64_t Archive::compress(const std::vector<FileInfo>& in_files) {
               }
             }
             uint8_t class_counts[12] = {0};
+            // Tokenize the window
+            std::vector<std::string> tokens;
+            std::string current;
             for (size_t j = 0; j < window; ++j) {
-              int cls = Phase1Profiler::classify(buffer[i + j]);
+              char c = buffer[i + j];
+              if (isalnum(c) || c == '&' || c == '<' || c == '>' || c == '/' || c == ';') {
+                current += c;
+              } else {
+                if (!current.empty()) {
+                  tokens.push_back(current);
+                  current.clear();
+                }
+                if (!isspace(c) && c != '\0') {
+                  tokens.push_back(std::string(1, c));
+                }
+              }
+            }
+            if (!current.empty()) tokens.push_back(current);
+            // Count classes
+            for (const auto& token : tokens) {
+              int cls = Phase1Profiler::classify(token);
               if (cls < 12) class_counts[cls]++;
             }
             profiler_->log(i, entropy, class_counts);

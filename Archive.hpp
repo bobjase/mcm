@@ -25,6 +25,7 @@
 #define ARCHIVE_HPP_
 
 #include <thread>
+#include <cctype>
 
 #include "CM.hpp"
 #include "Compressor.hpp"
@@ -56,14 +57,71 @@ public:
     records.push_back(r);
   }
 
-  static int classify(uint8_t b) {
-    if (b == ' ' || b == '\t' || b == '\n' || b == '\r') return 0; // whitespace
-    if (b >= 'a' && b <= 'z') return 1; // lowercase
-    if (b >= 'A' && b <= 'Z') return 2; // uppercase
-    if (b >= '0' && b <= '9') return 3; // digits
-    if ((b >= '!' && b <= '/') || (b >= ':' && b <= '@') || (b >= '[' && b <= '`') || (b >= '{' && b <= '~')) return 4; // punctuation
-    if (b == '<' || b == '>' || b == '/' || b == '=' || b == '"') return 5; // xml
-    return 6; // other
+  static int classify(const std::string& token) {
+    // Markup (10) - highest precedence
+    if (!token.empty()) {
+      if (token[0] == '<' || (token.size() >= 2 && token.substr(0, 2) == "</") || token.back() == '>' ||
+          (token[0] == '&' && token.back() == ';')) {
+        return 10;
+      }
+    }
+    // Capitalized (2)
+    if (!token.empty() && isupper(token[0])) {
+      bool is_cap = true;
+      for (size_t i = 1; i < token.size(); ++i) {
+        if (!islower(token[i])) {
+          is_cap = false;
+          break;
+        }
+      }
+      if (is_cap) return 2;
+    }
+    // Alphanumeric (4)
+    bool has_letter = false, has_digit = false;
+    for (char c : token) {
+      if (isalpha(c)) has_letter = true;
+      if (isdigit(c)) has_digit = true;
+    }
+    if (has_letter && has_digit) return 4;
+    // Lowercase (0)
+    bool is_lower = true;
+    for (char c : token) {
+      if (!islower(c)) {
+        is_lower = false;
+        break;
+      }
+    }
+    if (is_lower) return 0;
+    // Uppercase (1)
+    bool is_upper = true;
+    for (char c : token) {
+      if (!isupper(c)) {
+        is_upper = false;
+        break;
+      }
+    }
+    if (is_upper) return 1;
+    // Digits (3)
+    bool is_digit = true;
+    for (char c : token) {
+      if (!isdigit(c)) {
+        is_digit = false;
+        break;
+      }
+    }
+    if (is_digit) return 3;
+    // Whitespace (5)
+    if (token.find_first_not_of(" \t\n\r") == std::string::npos) return 5;
+    // Brackets (7)
+    if (token.size() == 1 && (token[0] == '(' || token[0] == ')' || token[0] == '[' || token[0] == ']' || token[0] == '{' || token[0] == '}')) return 7;
+    // Operators (8)
+    if (token.size() == 1 && (token[0] == '=' || token[0] == '+' || token[0] == '-' || token[0] == '*' || token[0] == '/' || token[0] == '<' || token[0] == '>' || token[0] == '|' || token[0] == '&' || token[0] == '^' || token[0] == '%')) return 8;
+    // Quotes (9)
+    if (token.size() == 1 && (token[0] == '\'' || token[0] == '"')) return 9;
+    // Punctuation (6)
+    if (token.size() == 1 && (token[0] == '.' || token[0] == ',' || token[0] == ';' || token[0] == ':' || token[0] == '!' || token[0] == '?')) return 6;
+    // Other (11)
+    return 11;
   }
 
   void compute_global_stats() {

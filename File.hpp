@@ -88,6 +88,7 @@ public:
   void SetName(const std::string& name) {
     name_ = name;
   }
+  const std::string& name() const { return name_; }
   static void CreateDir(const std::string& name);
 
 private:

@@ -443,6 +443,7 @@ int main(int argc, char* argv[]) {
           const int num_classes = 12;
           int transition_matrix[12][12];
           memset(transition_matrix, 0, sizeof(transition_matrix));
+          uint64_t total_counts[12] = {0};
           int prev_class = -1;
           double total_churn = 0;
           for (auto& r : profiler_ptr->records) {
@@ -472,8 +473,37 @@ int main(int argc, char* argv[]) {
             if (d > mean_delta + 2.5 * stddev_delta) spikes_2_5++;
             if (d > mean_delta + 3.0 * stddev_delta) spikes_3_0++;
           }
+          // Validation
+          int active_classes = 0;
+          for (int i = 0; i < num_classes; ++i) {
+            int sum = 0;
+            for (int j = 0; j < num_classes; ++j) sum += transition_matrix[i][j];
+            if (sum > 0) active_classes++;
+          }
+          bool validation_passed = true;
+          std::vector<std::string> errors;
+          std::vector<std::string> warnings;
+          if (stddev_entropy < 0.05) {
+            validation_passed = false;
+            errors.push_back("Entropy stddev too low (< 0.05)");
+          }
+          if (coarseness < 0.005) {
+            validation_passed = false;
+            errors.push_back("Coarseness too low (< 0.005)");
+          }
+          if (active_classes < 8) {
+            validation_passed = false;
+            errors.push_back("Insufficient token class diversity");
+          }
+          if (spikes_2_5 == 0) {
+            validation_passed = false;
+            errors.push_back("No entropy spikes at k=2.5");
+          }
+          if (active_classes >= 8 && active_classes <= 9) {
+            warnings.push_back("Low token class diversity");
+          }
           // Write JSON
-          std::string final_file = ".phase1.final";
+          std::string final_file = options.files[0].name() + ".phase1.final";
           std::ofstream fout_final(final_file);
           if (fout_final) {
             fout_final << "{\n";
@@ -493,7 +523,11 @@ int main(int argc, char* argv[]) {
             fout_final << "  \"cdc_plus_parameters\": {\n";
             fout_final << "    \"target_segment_bytes\": " << target_segment_size << ",\n";
             fout_final << "    \"min_segment_bytes\": " << min_segment_size << ",\n";
-            fout_final << "    \"max_segment_bytes\": " << max_segment_size << ",\n";
+            fout_final << "    \"max_segment_policy\": {\n";
+            fout_final << "      \"low_variance_max\": 262144,\n";
+            fout_final << "      \"high_variance_max\": 131072,\n";
+            fout_final << "      \"variance_gate_ratio\": 0.25\n";
+            fout_final << "    },\n";
             fout_final << "    \"entropy_threshold\": " << entropy_threshold << "\n";
             fout_final << "  },\n";
             fout_final << "  \"token_class_stats\": {\n";
@@ -510,6 +544,21 @@ int main(int argc, char* argv[]) {
             }
             fout_final << "    ],\n";
             fout_final << "    \"avg_churn\": " << avg_churn << "\n";
+            fout_final << "  },\n";
+            fout_final << "  \"validation\": {\n";
+            fout_final << "    \"passed\": " << (validation_passed ? "true" : "false") << ",\n";
+            fout_final << "    \"warnings\": [";
+            for (size_t i = 0; i < warnings.size(); ++i) {
+              fout_final << "\"" << warnings[i] << "\"";
+              if (i < warnings.size() - 1) fout_final << ",";
+            }
+            fout_final << "],\n";
+            fout_final << "    \"errors\": [";
+            for (size_t i = 0; i < errors.size(); ++i) {
+              fout_final << "\"" << errors[i] << "\"";
+              if (i < errors.size() - 1) fout_final << ",";
+            }
+            fout_final << "]\n";
             fout_final << "  }\n";
             fout_final << "}\n";
             fout_final.close();
