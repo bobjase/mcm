@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <string>
+#include <vector>
+#include <cmath>
+#include <cstring>
 #include <sstream>
 #include <thread>
 
@@ -384,6 +387,136 @@ int main(int argc, char* argv[]) {
         std::cout << "Phase 1 profiling written to " << phase1_file << std::endl;
         if (options.phase1_dump_csv) {
           profiler_ptr->dump_csv(std::cout);
+        }
+        // Compute Phase 1 final stats
+        if (!profiler_ptr->records.empty()) {
+          std::cout << "Computing Phase 1 final stats" << std::endl;
+          // Compute entropies
+          std::vector<float> entropies;
+          for (auto& r : profiler_ptr->records) entropies.push_back(r.entropy);
+          // Mean entropy
+          double sum_entropy = 0;
+          for (float e : entropies) sum_entropy += e;
+          double mean_entropy = sum_entropy / entropies.size();
+          // Stddev entropy
+          double sum_sq = 0;
+          for (float e : entropies) sum_sq += (e - mean_entropy) * (e - mean_entropy);
+          double stddev_entropy = std::sqrt(sum_sq / entropies.size());
+          // Deltas
+          std::vector<float> deltas;
+          for (size_t i = 1; i < entropies.size(); ++i) {
+            deltas.push_back(entropies[i] - entropies[i-1]);
+          }
+          double mean_delta = 0;
+          double stddev_delta = 0;
+          if (!deltas.empty()) {
+            double sum_d = 0;
+            for (float d : deltas) sum_d += d;
+            mean_delta = sum_d / deltas.size();
+            double sum_sq_d = 0;
+            for (float d : deltas) sum_sq_d += (d - mean_delta) * (d - mean_delta);
+            stddev_delta = std::sqrt(sum_sq_d / deltas.size());
+          }
+          // Coarseness
+          double coarseness = (mean_entropy > 0) ? stddev_delta / mean_entropy : 0;
+          // Spikes for k=2.5
+          std::vector<size_t> spike_positions;
+          for (size_t i = 0; i < deltas.size(); ++i) {
+            if (deltas[i] > mean_delta + 2.5 * stddev_delta) {
+              spike_positions.push_back(i);
+            }
+          }
+          // Target segment size
+          int target_segment_size = 16384; // default
+          if (spike_positions.size() > 1) {
+            double total_dist = 0;
+            for (size_t p = 1; p < spike_positions.size(); ++p) {
+              total_dist += spike_positions[p] - spike_positions[p-1];
+            }
+            double mean_spike_dist = total_dist / (spike_positions.size() - 1);
+            target_segment_size = static_cast<int>(mean_spike_dist * 1024); // stride
+          }
+          int min_segment_size = target_segment_size / 4;
+          int max_segment_size = (coarseness < 0.5) ? target_segment_size * 8 : target_segment_size * 2;
+          double entropy_threshold = mean_delta + 2.5 * stddev_delta;
+          // Token class stats
+          const int num_classes = 12;
+          int transition_matrix[12][12];
+          memset(transition_matrix, 0, sizeof(transition_matrix));
+          int prev_class = -1;
+          double total_churn = 0;
+          for (auto& r : profiler_ptr->records) {
+            // Find dominant class
+            int max_count = 0;
+            int dominant = 0;
+            for (int c = 0; c < num_classes; ++c) {
+              if (r.class_histogram[c] > max_count) {
+                max_count = r.class_histogram[c];
+                dominant = c;
+              }
+            }
+            if (prev_class != -1) {
+              transition_matrix[prev_class][dominant]++;
+            }
+            prev_class = dominant;
+            // Churn: number of non-zero classes
+            int churn = 0;
+            for (int c = 0; c < num_classes; ++c) if (r.class_histogram[c] > 0) churn++;
+            total_churn += churn;
+          }
+          double avg_churn = total_churn / profiler_ptr->records.size();
+          // Spikes counts
+          int spikes_2_0 = 0, spikes_2_5 = 0, spikes_3_0 = 0;
+          for (float d : deltas) {
+            if (d > mean_delta + 2.0 * stddev_delta) spikes_2_0++;
+            if (d > mean_delta + 2.5 * stddev_delta) spikes_2_5++;
+            if (d > mean_delta + 3.0 * stddev_delta) spikes_3_0++;
+          }
+          // Write JSON
+          std::string final_file = ".phase1.final";
+          std::ofstream fout_final(final_file);
+          if (fout_final) {
+            fout_final << "{\n";
+            fout_final << "  \"phase\": 1,\n";
+            fout_final << "  \"profiling_bytes\": " << in_bytes << ",\n";
+            fout_final << "  \"entropy\": {\n";
+            fout_final << "    \"mean\": " << mean_entropy << ",\n";
+            fout_final << "    \"stddev\": " << stddev_entropy << ",\n";
+            fout_final << "    \"delta_stddev\": " << stddev_delta << "\n";
+            fout_final << "  },\n";
+            fout_final << "  \"coarseness\": " << coarseness << ",\n";
+            fout_final << "  \"entropy_spikes\": {\n";
+            fout_final << "    \"k_2_0\": " << spikes_2_0 << ",\n";
+            fout_final << "    \"k_2_5\": " << spikes_2_5 << ",\n";
+            fout_final << "    \"k_3_0\": " << spikes_3_0 << "\n";
+            fout_final << "  },\n";
+            fout_final << "  \"cdc_plus_parameters\": {\n";
+            fout_final << "    \"target_segment_bytes\": " << target_segment_size << ",\n";
+            fout_final << "    \"min_segment_bytes\": " << min_segment_size << ",\n";
+            fout_final << "    \"max_segment_bytes\": " << max_segment_size << ",\n";
+            fout_final << "    \"entropy_threshold\": " << entropy_threshold << "\n";
+            fout_final << "  },\n";
+            fout_final << "  \"token_class_stats\": {\n";
+            fout_final << "    \"transition_matrix\": [\n";
+            for (int i = 0; i < num_classes; ++i) {
+              fout_final << "      [";
+              for (int j = 0; j < num_classes; ++j) {
+                fout_final << transition_matrix[i][j];
+                if (j < num_classes - 1) fout_final << ",";
+              }
+              fout_final << "]";
+              if (i < num_classes - 1) fout_final << ",";
+              fout_final << "\n";
+            }
+            fout_final << "    ],\n";
+            fout_final << "    \"avg_churn\": " << avg_churn << "\n";
+            fout_final << "  }\n";
+            fout_final << "}\n";
+            fout_final.close();
+            std::cout << "Phase 1 final artifact written to " << final_file << std::endl;
+          } else {
+            std::cout << "Failed to open final file" << std::endl;
+          }
         }
         delete profiler_ptr;
       }

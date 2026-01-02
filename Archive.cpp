@@ -25,6 +25,8 @@
 
 #include <algorithm>
 #include <cstring>
+#include <array>
+#include <cmath>
 
 #include "CM-inl.hpp"
 #include "X86Binary.hpp"
@@ -776,6 +778,43 @@ uint64_t Archive::compress(const std::vector<FileInfo>& in_files) {
     return a->total_size_ < b->total_size_;
   });
   writeBlocks();
+  // Compute Phase 1 profiling before compression
+  if (profiler_) {
+    for (auto& file : files_) {
+      if (!file.isDir()) {
+        File f;
+        if (f.open(file.getFullName(), std::ios_base::in | std::ios_base::binary) == 0) {
+          size_t file_size = f.length();
+          std::vector<uint8_t> buffer(file_size);
+          f.read(&buffer[0], file_size);
+          f.close();
+          // compute rolling entropy
+          const size_t window = profiler_->WINDOW_SIZE;
+          const size_t stride = profiler_->STRIDE;
+          for (size_t i = 0; i + window <= file_size; i += stride) {
+            double entropy = 0.0;
+            std::array<int, 256> counts = {0};
+            for (size_t j = 0; j < window; ++j) {
+              counts[buffer[i + j]]++;
+            }
+            for (int c : counts) {
+              if (c > 0) {
+                double p = static_cast<double>(c) / window;
+                entropy -= p * log2(p);
+              }
+            }
+            uint8_t class_counts[12] = {0};
+            for (size_t j = 0; j < window; ++j) {
+              int cls = Phase1Profiler::classify(buffer[i + j]);
+              if (cls < 12) class_counts[cls]++;
+            }
+            profiler_->log(i, entropy, class_counts);
+          }
+        }
+      }
+    }
+    profiler_->compute_global_stats();
+  }
   uint64_t total = 0;
   for (const auto& block : blocks_) {
     auto start_pos = stream_->tell();
@@ -797,9 +836,6 @@ uint64_t Archive::compress(const std::vector<FileInfo>& in_files) {
     std::unique_ptr<Compressor> comp(algo->CreateCompressor(freq));
     if (!comp->setOpt(opt_var_)) return 0;
     if (!comp->setOpts(opt_vars_)) return 0;
-    if (profiler_) {
-      comp->setEntropyLogger([this](uint64_t o, double e, uint8_t b) { if (profiler_) profiler_->log(o, e, b); });
-    }
     {
       ProgressThread thr(&segstream, stream_, true, out_start);
       comp->compress(in_stream, stream_);

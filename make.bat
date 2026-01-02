@@ -6,4 +6,5 @@ if errorlevel 1 (
   echo Compilation failed.
 ) else (
   echo mcm.exe created.
+  .\mcm.exe --phase1-profile testFiles/large.txt
 )

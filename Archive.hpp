@@ -36,7 +36,7 @@ class Phase1Profiler {
 public:
   static constexpr size_t WINDOW_SIZE = 4096;
   static constexpr size_t STRIDE = 1024;
-  static constexpr size_t NUM_CLASSES = 7;
+  static constexpr size_t NUM_CLASSES = 12;
 
   struct WindowRecord {
     uint64_t offset;
@@ -45,35 +45,15 @@ public:
   };
 
   std::vector<WindowRecord> records;
-  std::deque<double> entropy_buffer;
-  std::deque<uint8_t> byte_buffer;
   uint64_t current_offset = 0;
   double mean_ = 0, stdev_ = 0;
 
-  void log(uint64_t offset, double entropy, uint8_t byte) {
-    current_offset = offset;
-    entropy_buffer.push_back(entropy);
-    byte_buffer.push_back(byte);
-    if (entropy_buffer.size() > WINDOW_SIZE) {
-      entropy_buffer.pop_front();
-      byte_buffer.pop_front();
-    }
-    if (offset % STRIDE == 0 && entropy_buffer.size() == WINDOW_SIZE) {
-      double sum = 0;
-      for (auto e : entropy_buffer) sum += e;
-      float H = sum / WINDOW_SIZE;
-      uint16_t counts[NUM_CLASSES] = {0};
-      for (auto b : byte_buffer) {
-        int cls = classify(b);
-        counts[cls]++;
-      }
-      uint8_t hist[NUM_CLASSES];
-      for (int i = 0; i < NUM_CLASSES; i++) {
-        hist[i] = static_cast<uint8_t>(counts[i] * 255 / WINDOW_SIZE);
-      }
-      records.push_back({offset, H, {}});
-      memcpy(records.back().class_histogram, hist, sizeof(hist));
-    }
+  void log(uint64_t offset, float entropy, const uint8_t* class_counts) {
+    WindowRecord r;
+    r.offset = offset;
+    r.entropy = entropy;
+    memcpy(r.class_histogram, class_counts, NUM_CLASSES);
+    records.push_back(r);
   }
 
   static int classify(uint8_t b) {
@@ -112,8 +92,7 @@ public:
 
   void write_phase1_file(const std::string& filename, uint64_t total_bytes) {
     compute_global_stats();
-    std::string phase1_file = filename + ".phase1";
-    std::ofstream fout(phase1_file, std::ios::binary);
+    std::ofstream fout(filename, std::ios::binary);
     // magic
     uint32_t magic = 0x50483130; // "PH10"
     fout.write((char*)&magic, 4);
