@@ -32,6 +32,151 @@
 #include "Stream.hpp"
 #include "Util.hpp"
 
+class Phase1Profiler {
+public:
+  static constexpr size_t WINDOW_SIZE = 4096;
+  static constexpr size_t STRIDE = 1024;
+  static constexpr size_t NUM_CLASSES = 7;
+
+  struct WindowRecord {
+    uint64_t offset;
+    float entropy;
+    uint8_t class_histogram[NUM_CLASSES];
+  };
+
+  std::vector<WindowRecord> records;
+  std::deque<double> entropy_buffer;
+  std::deque<uint8_t> byte_buffer;
+  uint64_t current_offset = 0;
+  double mean_ = 0, stdev_ = 0;
+
+  void log(uint64_t offset, double entropy, uint8_t byte) {
+    current_offset = offset;
+    entropy_buffer.push_back(entropy);
+    byte_buffer.push_back(byte);
+    if (entropy_buffer.size() > WINDOW_SIZE) {
+      entropy_buffer.pop_front();
+      byte_buffer.pop_front();
+    }
+    if (offset % STRIDE == 0 && entropy_buffer.size() == WINDOW_SIZE) {
+      double sum = 0;
+      for (auto e : entropy_buffer) sum += e;
+      float H = sum / WINDOW_SIZE;
+      uint16_t counts[NUM_CLASSES] = {0};
+      for (auto b : byte_buffer) {
+        int cls = classify(b);
+        counts[cls]++;
+      }
+      uint8_t hist[NUM_CLASSES];
+      for (int i = 0; i < NUM_CLASSES; i++) {
+        hist[i] = static_cast<uint8_t>(counts[i] * 255 / WINDOW_SIZE);
+      }
+      records.push_back({offset, H, {}});
+      memcpy(records.back().class_histogram, hist, sizeof(hist));
+    }
+  }
+
+  static int classify(uint8_t b) {
+    if (b == ' ' || b == '\t' || b == '\n' || b == '\r') return 0; // whitespace
+    if (b >= 'a' && b <= 'z') return 1; // lowercase
+    if (b >= 'A' && b <= 'Z') return 2; // uppercase
+    if (b >= '0' && b <= '9') return 3; // digits
+    if ((b >= '!' && b <= '/') || (b >= ':' && b <= '@') || (b >= '[' && b <= '`') || (b >= '{' && b <= '~')) return 4; // punctuation
+    if (b == '<' || b == '>' || b == '/' || b == '=' || b == '"') return 5; // xml
+    return 6; // other
+  }
+
+  void compute_global_stats() {
+    if (records.empty()) return;
+    std::vector<double> ents;
+    for (auto& r : records) ents.push_back(r.entropy);
+    std::sort(ents.begin(), ents.end());
+    mean_ = std::accumulate(ents.begin(), ents.end(), 0.0) / ents.size();
+    double var = 0;
+    for (auto e : ents) var += (e - mean_) * (e - mean_);
+    stdev_ = sqrt(var / ents.size());
+  }
+
+  std::vector<uint64_t> find_boundaries() {
+    std::vector<uint64_t> boundaries;
+    if (records.size() < 2) return boundaries;
+    for (size_t i = 1; i < records.size(); i++) {
+      double H = records[i].entropy;
+      double prev_H = records[i-1].entropy;
+      if (H > mean_ + 2.5 * stdev_ && H - prev_H > stdev_) {
+        boundaries.push_back(records[i].offset);
+      }
+    }
+    return boundaries;
+  }
+
+  void write_phase1_file(const std::string& filename, uint64_t total_bytes) {
+    compute_global_stats();
+    std::string phase1_file = filename + ".phase1";
+    std::ofstream fout(phase1_file, std::ios::binary);
+    // magic
+    uint32_t magic = 0x50483130; // "PH10"
+    fout.write((char*)&magic, 4);
+    // window_size
+    uint32_t ws = WINDOW_SIZE;
+    fout.write((char*)&ws, 4);
+    // stride
+    uint32_t st = STRIDE;
+    fout.write((char*)&st, 4);
+    // total_bytes
+    fout.write((char*)&total_bytes, 8);
+    // num_windows
+    uint32_t nw = records.size();
+    fout.write((char*)&nw, 4);
+    // global stats
+    double p75 = 0, p90 = 0, p95 = 0;
+    if (!records.empty()) {
+      std::vector<double> ents;
+      for (auto& r : records) ents.push_back(r.entropy);
+      std::sort(ents.begin(), ents.end());
+      size_t idx75 = ents.size() * 0.75;
+      size_t idx90 = ents.size() * 0.9;
+      size_t idx95 = ents.size() * 0.95;
+      p75 = ents[idx75];
+      p90 = ents[idx90];
+      p95 = ents[idx95];
+    }
+    fout.write((char*)&mean_, 8);
+    fout.write((char*)&stdev_, 8);
+    fout.write((char*)&p75, 8);
+    fout.write((char*)&p90, 8);
+    fout.write((char*)&p95, 8);
+    // window records
+    for (auto& r : records) {
+      fout.write((char*)&r.offset, 8);
+      fout.write((char*)&r.entropy, 4);
+      fout.write((char*)r.class_histogram, NUM_CLASSES);
+    }
+    // boundaries
+    auto boundaries = find_boundaries();
+    uint32_t nb = boundaries.size();
+    fout.write((char*)&nb, 4);
+    for (auto b : boundaries) {
+      fout.write((char*)&b, 8);
+      float ent = 0;
+      for (auto& r : records) {
+        if (r.offset == b) {
+          ent = r.entropy;
+          break;
+        }
+      }
+      fout.write((char*)&ent, 4);
+    }
+  }
+
+  void dump_csv(std::ostream& os) {
+    os << "offset,entropy\n";
+    for (auto& r : records) {
+      os << r.offset << "," << r.entropy << "\n";
+    }
+  }
+};
+
 // Force filter
 enum FilterType {
   kFilterTypeNone,
@@ -151,6 +296,9 @@ public:
   // Decompression.
   Archive(Stream* stream);
 
+  // Compression with profiling.
+  Archive(Stream* stream, const CompressionOptions& options, Phase1Profiler* profiler);
+
   // Construct blocks from analyzer.
   void constructBlocks(Analyzer::Blocks* blocks_for_file);
 
@@ -192,7 +340,8 @@ private:
   CompressionOptions options_;
   size_t opt_var_;  
   FileList files_;  // File list.
-  Blocks blocks_;  // Solid blocks.
+  Blocks blocks_;
+  Phase1Profiler* profiler_ = nullptr;
 
   void init();
   Compressor* createMetaDataCompressor();

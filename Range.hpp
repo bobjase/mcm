@@ -27,6 +27,8 @@
 #include "Compressor.hpp"
 #include <assert.h>
 #include "Model.hpp"
+#include <functional>
+#include <cmath>
 
 // From 7zip, added single bit functions
 class Range7 {
@@ -36,6 +38,7 @@ private:
   uint32_t Range = Top, Code = 0, _cacheSize = 1;
   uint64_t Low = 0;
   uint8_t _cache = 0;
+  std::function<void(double)> entropy_callback_;
 
   template <typename TOut>
   ALWAYS_INLINE void shiftLow(TOut& sout) { //Emit the top byte 
@@ -51,6 +54,7 @@ private:
     Low = static_cast<uint32_t>(Low << 8);
   }
 public:
+  void setEntropyCallback(std::function<void(double)> cb) { entropy_callback_ = cb; }
   template <typename TOut>
   ALWAYS_INLINE void IncreaseRange(TOut& out) {
     while (Range < TopValue) {
@@ -83,6 +87,11 @@ public:
       Range -= mid;
     }
     IncreaseRange(out);
+    if (entropy_callback_) {
+      double prob = static_cast<double>(p) / (1 << shift);
+      double e = bit ? -log2(prob + 1e-12) : -log2(1 - prob + 1e-12);
+      entropy_callback_(e);
+    }
   }
 
   template <typename TIn>

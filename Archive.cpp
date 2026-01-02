@@ -113,6 +113,11 @@ Archive::Archive(Stream* stream) : stream_(stream) {
   header_.read(stream_);
 }
 
+Archive::Archive(Stream* stream, const CompressionOptions& options, Phase1Profiler* profiler) : stream_(stream), options_(options), profiler_(profiler) {
+  init();
+  header_.write(stream_);
+}
+
 Compressor* Archive::Algorithm::CreateCompressor(const FrequencyCounter<256>& freq) {
   switch (algorithm_) {
   case Compressor::kTypeStore: return new Store;
@@ -486,7 +491,7 @@ void testFilter(Stream* stream, Analyzer* analyzer) {
 
 static inline std::string smartExt(const std::string& ext) {
   if (ext == "h" || ext == "hpp" || ext == "inl" || ext == "cpp") return "c";
-  if (ext == "jpg" || ext == "zip" || ext == "7z" || ext == "apk" || ext == "mp3" || ext == "gif" || ext == "png") return "ÿ" + ext;
+  if (ext == "jpg" || ext == "zip" || ext == "7z" || ext == "apk" || ext == "mp3" || ext == "gif" || ext == "png") return "ï¿½" + ext;
   return ext;
 }
 
@@ -792,6 +797,9 @@ uint64_t Archive::compress(const std::vector<FileInfo>& in_files) {
     std::unique_ptr<Compressor> comp(algo->CreateCompressor(freq));
     if (!comp->setOpt(opt_var_)) return 0;
     if (!comp->setOpts(opt_vars_)) return 0;
+    if (profiler_) {
+      comp->setEntropyLogger([this](uint64_t o, double e, uint8_t b) { if (profiler_) profiler_->log(o, e, b); });
+    }
     {
       ProgressThread thr(&segstream, stream_, true, out_start);
       comp->compress(in_stream, stream_);

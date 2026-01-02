@@ -34,6 +34,7 @@
 #include <ctime>
 #include <iomanip>
 #include <malloc.h>
+#include <functional>
 
 #include "Stream.hpp"
 #include "Util.hpp"
@@ -121,6 +122,7 @@ public:
   virtual bool setOpts(size_t* opts) {
     return true;
   }
+  virtual void setEntropyLogger(std::function<void(uint64_t, double, uint8_t)> logger) {}
   virtual uint32_t getOpt() const {
     return 0;
   }

@@ -50,7 +50,7 @@ static void printHeader() {
     << "======================================================================" << std::endl
     << "mcm compressor v" << Archive::Header::kCurMajorVersion << "." << Archive::Header::kCurMinorVersion
     << ", by Mathieu Chartier (c)2016 Google Inc." << std::endl
-    << "Ultra experimental, may contain bugs. Contact mathieu.a.chartier@gmail.com" << std::endl
+    << "Experimental, may contain bugs. Contact mathieu.a.chartier@gmail.com" << std::endl
     << "Special thanks to: Matt Mahoney, Stephan Busch, Christopher Mattern." << std::endl
     << "======================================================================" << std::endl;
 }
@@ -88,60 +88,190 @@ public:
   uint64_t block_size = kDefaultBlockSize;
   FileInfo archive_file;
   std::vector<FileInfo> files;
+  const std::string kDictArg = "-dict=";
+  const std::string kOutDictArg = "-out-dict=";
   std::string dict_file;
-  bool phase1_profile = false;
-  bool phase1_dump_csv = false;
 
-  // int usage(const std::string& name) {
-  //   printHeader();
-  //   std::cout
-  //     << "Caution: Experimental, use only for testing!" << std::endl
-  //     << "Usage: " << name << " [commands] [options] <infile|dir> <outfile>(default infile.mcm)" << std::endl
-  //     << "Options: d for decompress" << std::endl
-  //     << "-{t|f|m|h|x}{1 .. 11} compression option" << std::endl
-  //     << "t is turbo, f is fast, m is mid, h is high, x is max (default " << CompressionOptions::kDefaultLevel << ")" << std::endl
-  //     << "0 .. 11 specifies memory with 32mb .. 5gb per thread (default " << CompressionOptions::kDefaultMemUsage << ")" << std::endl
-  //     << "10 and 11 are only supported on 64 bits" << std::endl
-  //     << "-test tests the file after compression is done" << std::endl
-  //     // << "-b <mb> specifies block size in MB" << std::endl
-  //     // << "-t <threads> the number of threads to use (decompression requires the same number of threads" << std::endl
-  //     << "Examples:" << std::endl
-  //     << "Compress: " << name << " -m9 enwik8 enwik8.mcm" << std::endl
-  //     << "Decompress: " << name << " d enwik8.mcm enwik8.ref" << std::endl;
-  //   return 0;
-  // }
+  int usage(const std::string& name) {
+    printHeader();
+    std::cout
+      << "Caution: Experimental, use only for testing!" << std::endl
+      << "Usage: " << name << " [commands] [options] <infile|dir> <outfile>(default infile.mcm)" << std::endl
+      << "Options: d for decompress" << std::endl
+      << "-{t|f|m|h|x}{1 .. 11} compression option" << std::endl
+      << "t is turbo, f is fast, m is mid, h is high, x is max (default " << CompressionOptions::kDefaultLevel << ")" << std::endl
+      << "0 .. 11 specifies memory with 32mb .. 5gb per thread (default " << CompressionOptions::kDefaultMemUsage << ")" << std::endl
+      << "10 and 11 are only supported on 64 bits" << std::endl
+      << "-test tests the file after compression is done" << std::endl
+      // << "-b <mb> specifies block size in MB" << std::endl
+      // << "-t <threads> the number of threads to use (decompression requires the same number of threads" << std::endl
+      << "Examples:" << std::endl
+      << "Compress: " << name << " -m9 enwik8 enwik8.mcm" << std::endl
+      << "Decompress: " << name << " d enwik8.mcm enwik8.ref" << std::endl;
+    return 0;
+  }
 
   int parse(int argc, char* argv[]) {
     assert(argc >= 1);
     std::string program(trimExt(argv[0]));
-    const std::string kDictArg = "-dict=";
-    const std::string kOutDictArg = "-out-dict=";
     // Parse options.
-    bool has_comp_args = false;
     int i = 1;
-    for (; i < argc; ++i) {
+    bool has_comp_args = false;
+    for (;i < argc;++i) {
       const std::string arg(argv[i]);
-      if (arg == "--phase1-profile") {
-        phase1_profile = true;
-        mode = kModeCompress;
-      } else if (arg == "--phase1-dump-csv") {
-        phase1_dump_csv = true;
-      } else if (!arg.empty() && arg[0] != '-') {
-        files.push_back(FileInfo(arg));
-      } else {
-        std::cerr << "Unknown option " << arg << std::endl;
-        return 4;
+      Mode parsed_mode = kModeUnknown;
+      if (arg == "-test") parsed_mode = kModeSingleTest; // kModeTest;
+      else if (arg == "-memtest") parsed_mode = kModeMemTest;
+      else if (arg == "-opt") parsed_mode = kModeOpt;
+      else if (arg == "-stest") parsed_mode = kModeSingleTest;
+      else if (arg == "c") parsed_mode = kModeCompress;
+      else if (arg == "l") parsed_mode = kModeList;
+      else if (arg == "d") parsed_mode = kModeDecompress;
+      else if (arg == "a") parsed_mode = kModeAdd;
+      else if (arg == "e") parsed_mode = kModeExtract;
+      else if (arg == "x") parsed_mode = kModeExtractAll;
+      if (parsed_mode != kModeUnknown) {
+        if (mode != kModeUnknown) {
+          std::cerr << "Multiple commands specified" << std::endl;
+          return 2;
+        }
+        mode = parsed_mode;
+        switch (mode) {
+          case kModeAdd:
+          case kModeExtract:
+          case kModeExtractAll: {
+            if (++i >= argc) {
+              std::cerr << "Expected archive" << std::endl;
+              return 3;
+            }
+            // Archive is next.
+            archive_file = FileInfo(argv[i]);
+            break;
+          }
+        }
+      } else if (arg == "-opt") opt_mode = true;
+      else if (arg == "-filter=none") options_.filter_type_ = kFilterTypeNone;
+      else if (arg == "-filter=dict") options_.filter_type_ = kFilterTypeDict;
+      else if (arg == "-filter=x86") options_.filter_type_ = kFilterTypeX86;
+      else if (arg == "-filter=auto") options_.filter_type_ = kFilterTypeAuto;
+      else if (arg.substr(0, std::min(kDictArg.length(), arg.length())) == kDictArg) {
+        options_.dict_file_ = arg.substr(kDictArg.length());
+      } else if (arg.substr(0, std::min(kOutDictArg.length(), arg.length())) == kOutDictArg) {
+        options_.out_dict_file_ = arg.substr(kOutDictArg.length());
+      } else if (arg == "-lzp=auto") options_.lzp_type_ = kLZPTypeAuto;
+      else if (arg == "-lzp=true") options_.lzp_type_ = kLZPTypeEnable;
+      else if (arg == "-lzp=false") options_.lzp_type_ = kLZPTypeDisable;
+      else if (arg == "-b") {
+        if (i + 1 >= argc) {
+          return usage(program);
+        }
+        std::istringstream iss(argv[++i]);
+        iss >> block_size;
+        block_size *= MB;
+        if (!iss.good()) {
+          return usage(program);
+        }
+      } else if (arg == "-store") {
+        options_.comp_level_ = kCompLevelStore;
+        has_comp_args = true;
+      } else if (arg[0] == '-') {
+        if (arg[1] == 't') options_.comp_level_ = kCompLevelTurbo;
+        else if (arg[1] == 'f') options_.comp_level_ = kCompLevelFast;
+        else if (arg[1] == 'm') options_.comp_level_ = kCompLevelMid;
+        else if (arg[1] == 'h') options_.comp_level_ = kCompLevelHigh;
+        else if (arg[1] == 'x') options_.comp_level_ = kCompLevelMax;
+        else if (arg[1] == 's') options_.comp_level_ = kCompLevelSimple;
+        else {
+          std::cerr << "Unknown option " << arg << std::endl;
+          return 4;
+        }
+        has_comp_args = true;
+        const std::string mem_string = arg.substr(2);
+        if (mem_string == "0") options_.mem_usage_ = 0;
+        else if (mem_string == "1") options_.mem_usage_ = 1;
+        else if (mem_string == "2") options_.mem_usage_ = 2;
+        else if (mem_string == "3") options_.mem_usage_ = 3;
+        else if (mem_string == "4") options_.mem_usage_ = 4;
+        else if (mem_string == "5") options_.mem_usage_ = 5;
+        else if (mem_string == "6") options_.mem_usage_ = 6;
+        else if (mem_string == "7") options_.mem_usage_ = 7;
+        else if (mem_string == "8") options_.mem_usage_ = 8;
+        else if (mem_string == "9") options_.mem_usage_ = 9;
+        else if (mem_string == "10" || mem_string == "11") {
+          if (sizeof(void*) < 8) {
+            std::cerr << arg << " is only supported with 64 bit" << std::endl;
+            return usage(program);
+          }
+          options_.mem_usage_ = (mem_string == "10") ? 10 : 11;
+        } else if (!mem_string.empty()) {
+          std::cerr << "Unknown mem level " << mem_string << std::endl;
+          return 4;
+        }
+      } else if (!arg.empty()) {
+        if (mode == kModeAdd || mode == kModeExtract) {
+          files.push_back(FileInfo(argv[i]));  // Read in files.
+        } else {
+          break;  // Done parsing.
+        }
       }
     }
-    if (files.empty()) {
-      std::cerr << "No files specified" << std::endl;
+    if (mode == kModeUnknown) {
+      const int remaining_args = argc - i;
+      // No args, need to figure out what to do:
+      // decompress: mcm <archive> 
+      // TODO add files to archive: mcm <archive> <files>
+      // create archive: mcm <files>
+      mode = kModeCompress;
+      if (!has_comp_args && remaining_args == 1) {
+        // Try to open file.
+        File fin;
+        if (fin.open(argv[i], std::ios_base::in | std::ios_base::binary) == 0) {
+          Archive archive(&fin);
+          const auto& header = archive.getHeader();
+          if (header.isArchive()) {
+            mode = kModeDecompress;
+          }
+        }
+      }
+    }
+    const bool single_file_mode =
+      mode == kModeCompress || mode == kModeDecompress || mode == kModeSingleTest ||
+      mode == kModeMemTest || mode == kModeOpt || kModeList;
+    if (single_file_mode && i < argc) {
+      std::string in_file, out_file;
+      // Read in file and outfile.
+      in_file = argv[i++];
+      if (i < argc) {
+        out_file = argv[i++];
+      } else {
+        if (mode == kModeDecompress) {
+          out_file = in_file + ".decomp";
+        } else {
+          out_file = trimDir(in_file) + ".mcm";
+        }
+      }
+      if (mode == kModeMemTest) {
+        // No out file for memtest.
+        files.push_back(FileInfo(trimDir(in_file)));
+      } else if (mode == kModeCompress || mode == kModeSingleTest || mode == kModeOpt) {
+        archive_file = FileInfo(trimDir(out_file));
+        files.push_back(FileInfo(trimDir(in_file)));
+      } else {
+        archive_file = FileInfo(trimDir(in_file));
+        files.push_back(FileInfo(trimDir(out_file)));
+      }
+    }
+    if (mode != kModeMemTest &&
+      (archive_file.getName().empty() || (files.empty() && mode != kModeList))) {
+      std::cerr << "Error, input or output files missing" << std::endl;
+      usage(program);
       return 5;
     }
-    archive_file = FileInfo(files[0].getName() + ".mcm");
     return 0;
   }
 };
 
+extern void RunBenchmarks();
 int main(int argc, char* argv[]) {
   if (!kReleaseBuild) {
     RunAllTests();
@@ -151,10 +281,6 @@ int main(int argc, char* argv[]) {
   if (ret) {
     std::cerr << "Failed to parse arguments" << std::endl;
     return ret;
-  }
-  Phase1Profiler* profiler_ptr = nullptr;
-  if (options.phase1_profile) {
-    profiler_ptr = new Phase1Profiler();
   }
   switch (options.mode) {
   case Options::kModeMemTest: {
@@ -287,7 +413,7 @@ int main(int argc, char* argv[]) {
           auto a = i % kMaxIndex;
           auto b = (i + 1 + std::rand() % (kMaxIndex - 1)) % kMaxIndex;
           VoidWriteStream fout;
-          Archive archive(&fout, options.options_, profiler_ptr);
+          Archive archive(&fout, options.options_);
           if (i != 0) {
             ReplaceSubstring(opts, a, len, b, kOpts);
           }
@@ -315,7 +441,7 @@ int main(int argc, char* argv[]) {
         for (size_t i = 0;; ++i) {
           const clock_t start = clock();
           VoidWriteStream fout;
-          Archive archive(&fout, options.options_, profiler_ptr);
+          Archive archive(&fout, options.options_);
           if (!archive.setOpts(opts)) {
             continue;
           }
@@ -369,7 +495,7 @@ int main(int argc, char* argv[]) {
       }
 
       std::cout << "Compressing to " << out_file << " mode=" << options.options_.comp_level_ << " mem=" << options.options_.mem_usage_ << std::endl;
-      Archive archive(&fout, options.options_, profiler_ptr);
+      Archive archive(&fout, options.options_);
       uint64_t in_bytes = archive.compress(options.files);
       clock_t time = clock() - start;
       std::cout << "Done compressing " << formatNumber(in_bytes) << " -> " << formatNumber(fout.tell())
@@ -377,16 +503,6 @@ int main(int argc, char* argv[]) {
         << " bpc=" << double(fout.tell()) * 8.0 / double(in_bytes) << std::endl;
 
       fout.close();
-
-      if (profiler_ptr) {
-        std::string phase1_file = out_file + ".phase1";
-        profiler_ptr->write_phase1_file(phase1_file, in_bytes);
-        std::cout << "Phase 1 profiling written to " << phase1_file << std::endl;
-        if (options.phase1_dump_csv) {
-          profiler_ptr->dump_csv(std::cout);
-        }
-        delete profiler_ptr;
-      }
 
       if (options.mode == Options::kModeSingleTest) {
         if (err = fout.open(out_file, std::ios_base::in | std::ios_base::binary)) {
