@@ -29,6 +29,8 @@
 #include "Model.hpp"
 #include <functional>
 #include <cmath>
+#include <vector>
+#include <cmath>
 
 // From 7zip, added single bit functions
 class Range7 {
@@ -39,6 +41,8 @@ private:
   uint64_t Low = 0;
   uint8_t _cache = 0;
   std::function<void(double)> entropy_callback_;
+
+  static std::vector<double>* observer_costs;
 
   template <typename TOut>
   ALWAYS_INLINE void shiftLow(TOut& sout) { //Emit the top byte 
@@ -55,6 +59,7 @@ private:
   }
 public:
   void setEntropyCallback(std::function<void(double)> cb) { entropy_callback_ = cb; }
+  static void setObserver(std::vector<double>* costs) { observer_costs = costs; }
   template <typename TOut>
   ALWAYS_INLINE void IncreaseRange(TOut& out) {
     while (Range < TopValue) {
@@ -173,6 +178,10 @@ public:
     assert(size > 0);
     assert(start < total);
     assert(start + size <= total);
+    if (observer_costs) {
+      double p = static_cast<double>(size) / total;
+      observer_costs->push_back(-log2(p));
+    }
     Range /= total;
     Low += start * Range;
     Range *= size;
@@ -244,5 +253,7 @@ public:
     }
   }
 };
+
+inline std::vector<double>* Range7::observer_costs = nullptr;
 
 #endif

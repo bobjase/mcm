@@ -33,6 +33,7 @@
 #include <cstring>
 #include <sstream>
 #include <thread>
+#include <tuple>
 
 #include "Archive.hpp"
 #include "CM.hpp"
@@ -56,6 +57,28 @@ static void printHeader() {
     << "Ultra experimental, may contain bugs. Contact mathieu.a.chartier@gmail.com" << std::endl
     << "Special thanks to: Matt Mahoney, Stephan Busch, Christopher Mattern." << std::endl
     << "======================================================================" << std::endl;
+}
+
+static void printUsage(const std::string& name) {
+  printHeader();
+  std::cout
+    << "Caution: Experimental, use only for testing!" << std::endl
+    << "Usage: " << name << " [commands] [options] <infile|dir> <outfile>(default infile.mcm)" << std::endl
+    << "Commands:" << std::endl
+    << "  --phase1-profile <file>     : Profile entropy and generate phase1.final" << std::endl
+    << "  --phase1-dump-csv <file>    : Dump phase1 data as CSV" << std::endl
+    << "  --phase2p5-profile <file>   : Run Phase 2.5 reordering on <file>" << std::endl
+    << "Options: d for decompress" << std::endl
+    << "-{t|f|m|h|x}{1 .. 11} compression option" << std::endl
+    << "t is turbo, f is fast, m is mid, h is high, x is max (default " << CompressionOptions::kDefaultLevel << ")" << std::endl
+    << "0 .. 11 specifies memory with 32mb .. 5gb per thread (default " << CompressionOptions::kDefaultMemUsage << ")" << std::endl
+    << "10 and 11 are only supported on 64 bits" << std::endl
+    << "-test tests the file after compression is done" << std::endl
+    << "Examples:" << std::endl
+    << "Compress: " << name << " -m9 enwik8 enwik8.mcm" << std::endl
+    << "Decompress: " << name << " d enwik8.mcm enwik8.ref" << std::endl
+    << "Phase 1: " << name << " --phase1-profile enwik8" << std::endl
+    << "Phase 2.5: " << name << " --phase2p5-profile enwik8" << std::endl;
 }
 
 class Options {
@@ -93,7 +116,7 @@ public:
   std::vector<FileInfo> files;
   std::string dict_file;
   bool phase1_profile = false;
-  bool phase1_dump_csv = false;
+  bool phase2p75_measure = false;
 
   // int usage(const std::string& name) {
   //   printHeader();
@@ -129,12 +152,53 @@ public:
         mode = kModeCompress;
       } else if (arg == "--phase1-dump-csv") {
         phase1_dump_csv = true;
+      } else if (arg == "--phase2p5-profile") {
+        phase2p5_profile = true;
+        mode = kModeCompress;
+      } else if (arg == "--phase2p75-measure-headroom") {
+        phase2p75_measure = true;
+      } else if (arg == "d") {
+        mode = kModeDecompress;
+      } else if (arg == "-test") {
+        // Test after compression/decompression
+      } else if (arg.size() > 1 && arg[0] == '-' && std::string("tfmhx").find(arg[1]) != std::string::npos) {
+        char level_char = arg[1];
+        std::string num_str = arg.substr(2);
+        if (num_str.empty()) {
+          std::cerr << "Missing number after " << level_char << std::endl;
+          return 4;
+        }
+        try {
+          int num = std::stoi(num_str);
+          if (num < 0 || num > 11) {
+            std::cerr << "Invalid memory usage " << num << std::endl;
+            return 4;
+          }
+          options_.mem_usage_ = static_cast<size_t>(num);
+          switch (level_char) {
+            case 't': options_.comp_level_ = kCompLevelTurbo; break;
+            case 'f': options_.comp_level_ = kCompLevelFast; break;
+            case 'm': options_.comp_level_ = kCompLevelMid; break;
+            case 'h': options_.comp_level_ = kCompLevelHigh; break;
+            case 'x': options_.comp_level_ = kCompLevelMax; break;
+          }
+        } catch (const std::exception&) {
+          std::cerr << "Invalid number " << num_str << std::endl;
+          return 4;
+        }
       } else if (!arg.empty() && arg[0] != '-') {
         files.push_back(FileInfo(arg));
       } else {
         std::cerr << "Unknown option " << arg << std::endl;
         return 4;
       }
+    }
+    if (mode == kModeUnknown) {
+      mode = kModeCompress;
+    }
+    if (files.empty() && !phase1_profile && !phase1_dump_csv && !phase2p5_profile && !phase2p75_measure) {
+      printUsage(program);
+      return 0;
     }
     if (files.empty()) {
       std::cerr << "No files specified" << std::endl;
@@ -648,5 +712,330 @@ int main(int argc, char* argv[]) {
     break;
   }
   }
+
+  // Phase 2.5 profiling
+  if (options.phase2p5_profile) {
+    std::cout << "Starting Phase 2.5 profiling" << std::endl;
+    std::string input_file = options.files[0].name();
+    std::string segments_file = input_file + ".phase2.segments.txt";
+    std::ifstream fin_seg(segments_file);
+    if (!fin_seg) {
+      std::cerr << "Cannot open " << segments_file << std::endl;
+      return 1;
+    }
+    std::vector<std::tuple<uint64_t, uint64_t, double, double>> segments;
+    uint64_t start, end;
+    double mean, stddev;
+    while (fin_seg >> start >> end >> mean >> stddev) {
+      segments.emplace_back(start, end, mean, stddev);
+    }
+    fin_seg.close();
+
+    // Read original file
+    std::ifstream fin_orig(input_file, std::ios::binary);
+    std::vector<uint8_t> original((std::istreambuf_iterator<char>(fin_orig)), std::istreambuf_iterator<char>());
+    fin_orig.close();
+
+    // Extract segments
+    std::vector<std::vector<uint8_t>> segment_buffers;
+    for (auto& seg : segments) {
+      uint64_t s, e;
+      std::tie(s, e, std::ignore, std::ignore) = seg;
+      segment_buffers.emplace_back(original.begin() + s, original.begin() + e);
+    }
+
+    // Constants
+    const int N = 4096;
+    const double FP_THRESHOLD = 1e9; // No fingerprint, large
+    const double ENTROPY_DELTA_1 = 0.1;
+    const double ENTROPY_DELTA_2 = 0.5;
+
+    // Greedy successor selection
+    std::vector<int> order;
+    std::vector<bool> used(segments.size(), false);
+
+    // Start with lowest entropy segment
+    int current = -1;
+    double min_entropy = 1e9;
+    for (size_t i = 0; i < segments.size(); ++i) {
+      double ent = std::get<2>(segments[i]);
+      if (ent < min_entropy) {
+        min_entropy = ent;
+        current = i;
+      }
+    }
+    order.push_back(current);
+    used[current] = true;
+
+    std::string transitions_file = input_file + ".phase2p5.transitions.txt";
+    std::ofstream fout_trans(transitions_file);
+
+    while (order.size() < segments.size()) {
+      // Find candidates
+      std::vector<int> candidates;
+      int tier = 1;
+      double delta = ENTROPY_DELTA_1;
+      for (size_t i = 0; i < segments.size(); ++i) {
+        if (!used[i]) {
+          double ent_diff = std::abs(std::get<2>(segments[current]) - std::get<2>(segments[i]));
+          if (ent_diff <= delta) {
+            candidates.push_back(i);
+          }
+        }
+      }
+      if (candidates.empty()) {
+        tier = 2;
+        delta = ENTROPY_DELTA_2;
+        for (size_t i = 0; i < segments.size(); ++i) {
+          if (!used[i]) {
+            double ent_diff = std::abs(std::get<2>(segments[current]) - std::get<2>(segments[i]));
+            if (ent_diff <= delta) {
+              candidates.push_back(i);
+            }
+          }
+        }
+      }
+      if (candidates.empty()) {
+        tier = 3;
+        // All unused, sorted by entropy diff
+        std::vector<std::pair<double, int>> sorted;
+        for (size_t i = 0; i < segments.size(); ++i) {
+          if (!used[i]) {
+            double ent_diff = std::abs(std::get<2>(segments[current]) - std::get<2>(segments[i]));
+            sorted.emplace_back(ent_diff, i);
+          }
+        }
+        std::sort(sorted.begin(), sorted.end());
+        for (auto& p : sorted) {
+          candidates.push_back(p.second);
+        }
+      }
+
+      // Evaluate candidates
+      int best_b = -1;
+      uint64_t best_size = UINT64_MAX;
+      for (int b : candidates) {
+        // Extract tail(A) + head(B)
+        auto& buf_a = segment_buffers[current];
+        auto& buf_b = segment_buffers[b];
+        std::vector<uint8_t> tail_a(buf_a.end() - std::min(N, (int)buf_a.size()), buf_a.end());
+        std::vector<uint8_t> head_b(buf_b.begin(), buf_b.begin() + std::min(N, (int)buf_b.size()));
+        std::vector<uint8_t> combined = tail_a;
+        combined.insert(combined.end(), head_b.begin(), head_b.end());
+
+        // Compress
+        std::string temp_file = "temp_transition.bin";
+        std::ofstream fout_temp(temp_file, std::ios::binary);
+        fout_temp.write((char*)combined.data(), combined.size());
+        fout_temp.close();
+        FileInfo temp_info(temp_file);
+        std::vector<FileInfo> temp_files = {temp_info};
+        CompressionOptions fast_options = options.options_;
+        fast_options.comp_level_ = kCompLevelTurbo;
+        VoidWriteStream vws;
+        Archive archive(&vws, fast_options, nullptr);
+        uint64_t in_bytes = archive.compress(temp_files);
+        uint64_t comp_size = vws.tell();
+        std::remove(temp_file.c_str());
+
+        if (comp_size < best_size) {
+          best_size = comp_size;
+          best_b = b;
+        }
+      }
+
+      // Select best
+      order.push_back(best_b);
+      used[best_b] = true;
+
+      // Log
+      double buffer_len = std::min(N, (int)segment_buffers[current].size()) + std::min(N, (int)segment_buffers[best_b].size());
+      double bpb = best_size * 8.0 / buffer_len;
+      fout_trans << current << " " << best_b << " " << tier << " " << best_size << " " << buffer_len << " " << bpb << std::endl;
+
+      current = best_b;
+    }
+    fout_trans.close();
+
+    // Reordered file
+    std::string reordered_file = input_file + ".phase2p5.reordered";
+    std::ofstream fout_reordered(reordered_file, std::ios::binary);
+    for (int idx : order) {
+      fout_reordered.write((char*)segment_buffers[idx].data(), segment_buffers[idx].size());
+    }
+    fout_reordered.close();
+
+    // Index
+    std::string index_file = input_file + ".phase2p5.index.json";
+    std::ofstream fout_index(index_file);
+    fout_index << "{\n";
+    fout_index << "  \"reordered_to_original\": [";
+    for (size_t i = 0; i < order.size(); ++i) {
+      fout_index << order[i];
+      if (i < order.size() - 1) fout_index << ",";
+    }
+    fout_index << "],\n";
+    fout_index << "  \"original_to_reordered\": [";
+    std::vector<int> orig_to_reordered(order.size());
+    for (size_t i = 0; i < order.size(); ++i) {
+      orig_to_reordered[order[i]] = i;
+    }
+    for (size_t i = 0; i < orig_to_reordered.size(); ++i) {
+      fout_index << orig_to_reordered[i];
+      if (i < orig_to_reordered.size() - 1) fout_index << ",";
+    }
+    fout_index << "]\n";
+    fout_index << "}\n";
+    fout_index.close();
+
+    // Validation
+    uint64_t reordered_size = 0;
+    for (auto& buf : segment_buffers) reordered_size += buf.size();
+    if (reordered_size != original.size()) {
+      std::cerr << "Size mismatch" << std::endl;
+      return 1;
+    }
+    std::vector<int> used_count(segments.size(), 0);
+    for (int idx : order) {
+      if (idx < 0 || idx >= (int)segments.size()) {
+        std::cerr << "Invalid index" << std::endl;
+        return 1;
+      }
+      used_count[idx]++;
+    }
+    for (int c : used_count) {
+      if (c != 1) {
+        std::cerr << "Segment used " << c << " times" << std::endl;
+        return 1;
+      }
+    }
+    std::cout << "Phase 2.5 completed successfully" << std::endl;
+  }
+
+  // Phase 2.75 headroom measurement
+  if (options.phase2p75_measure) {
+    std::cout << "Starting Phase 2.75 headroom measurement" << std::endl;
+    std::string input_file = options.files[0].name();
+    std::string segments_file = input_file + ".phase2.segments.txt";
+    std::ifstream fin_seg(segments_file);
+    if (!fin_seg) {
+      std::cerr << "Cannot open " << segments_file << std::endl;
+      return 1;
+    }
+    std::vector<std::tuple<uint64_t, uint64_t, double, double>> segments;
+    uint64_t start, end;
+    double mean, stddev;
+    while (fin_seg >> start >> end >> mean >> stddev) {
+      segments.emplace_back(start, end, mean, stddev);
+    }
+    fin_seg.close();
+
+    // Read original file
+    std::ifstream fin_orig(input_file, std::ios::binary);
+    std::vector<uint8_t> original((std::istreambuf_iterator<char>(fin_orig)), std::istreambuf_iterator<char>());
+    fin_orig.close();
+
+    // Select blocks: size >=64KB, variance <=0.01, not within 8KB of cuts, within first 5MB
+    const uint64_t min_size = 65536;
+    const double max_variance = 0.01;
+    const uint64_t margin = 8192;
+    const uint64_t max_offset = 5242880; // 5MB
+    std::vector<std::tuple<int, uint64_t, uint64_t>> selected_blocks;
+    for (size_t i = 0; i < segments.size(); ++i) {
+      auto [s, e, m, v] = segments[i];
+      uint64_t len = e - s;
+      if (len >= min_size && v <= max_variance && s >= margin && e <= original.size() - margin && e <= max_offset) {
+        selected_blocks.emplace_back(i, s, e);
+      }
+    }
+    if (selected_blocks.size() > 40) selected_blocks.resize(40); // limit to 40
+
+    // Output selected blocks
+    std::string blocks_file = input_file + ".phase2p75.blocks.txt";
+    std::ofstream fout_blocks(blocks_file);
+    for (auto& b : selected_blocks) {
+      int id; uint64_t s, e;
+      std::tie(id, s, e) = b;
+      fout_blocks << id << " " << s << " " << e << " " << (e - s) << std::endl;
+    }
+    fout_blocks.close();
+
+    // Measurements
+    std::string report_file = input_file + ".phase2p75.report.txt";
+    std::ofstream fout_report(report_file);
+    double total_avoidable_bits = 0;
+    uint64_t total_measured_bytes = 0;
+    for (auto& b : selected_blocks) {
+      int id; uint64_t s, e;
+      std::tie(id, s, e) = b;
+      uint64_t len = e - s;
+      std::vector<uint8_t> block(original.begin() + s, original.begin() + e);
+
+      // Cold cost
+      std::vector<double> costs;
+      Range7::observer_costs = &costs;
+      costs.clear();
+      std::string temp_file = "temp_block.bin";
+      std::ofstream fout_temp(temp_file, std::ios::binary);
+      fout_temp.write((char*)block.data(), block.size());
+      fout_temp.close();
+      FileInfo temp_info(temp_file);
+      std::vector<FileInfo> temp_files = {temp_info};
+      VoidWriteStream vws;
+      Archive archive(&vws, options.options_, nullptr);
+      archive.compress(temp_files);
+      Range7::observer_costs = nullptr;
+      double cold_cost = std::accumulate(costs.begin(), costs.end(), 0.0);
+      std::remove(temp_file.c_str());
+
+      // Warm cost
+      uint64_t warm_start = (s >= 262144) ? s - 262144 : 0; // 256KB
+      uint64_t warm_len = s - warm_start;
+      if (warm_len >= 65536) {
+        std::vector<uint8_t> warm_block(original.begin() + warm_start, original.begin() + s);
+        std::vector<uint8_t> combined = warm_block;
+        combined.insert(combined.end(), block.begin(), block.end());
+
+        costs.clear();
+        Range7::observer_costs = &costs;
+        std::string temp_file2 = "temp_combined.bin";
+        std::ofstream fout_temp2(temp_file2, std::ios::binary);
+        fout_temp2.write((char*)combined.data(), combined.size());
+        fout_temp2.close();
+        FileInfo temp_info2(temp_file2);
+        std::vector<FileInfo> temp_files2 = {temp_info2};
+        VoidWriteStream vws2;
+        Archive archive2(&vws2, options.options_, nullptr);
+        archive2.compress(temp_files2);
+        Range7::observer_costs = nullptr;
+        double warm_cost = std::accumulate(costs.begin() + warm_len, costs.end(), 0.0);
+        std::remove(temp_file2.c_str());
+
+        double delta = cold_cost - warm_cost;
+        total_avoidable_bits += delta;
+        total_measured_bytes += len;
+
+        fout_report << "Block " << id << ":\n";
+        fout_report << "  Size: " << len << " bytes\n";
+        fout_report << "  Cold cost: " << cold_cost << " bits\n";
+        fout_report << "  Warm cost: " << warm_cost << " bits\n";
+        fout_report << "  Delta: " << delta << " bits (" << (delta / cold_cost * 100) << "%)\n\n";
+      }
+    }
+
+    double avoidable_per_mb = total_avoidable_bits / total_measured_bytes * 1000000;
+    double projected_gain_kb = total_avoidable_bits / 8 / 1024;
+
+    fout_report << "SUMMARY:\n";
+    fout_report << "Blocks tested: " << selected_blocks.size() << "\n";
+    fout_report << "Total measured bytes: " << total_measured_bytes / 1000000.0 << " MB\n";
+    fout_report << "Total avoidable bits: " << total_avoidable_bits << "\n";
+    fout_report << "Avoidable bits per MB: " << avoidable_per_mb << "\n";
+    fout_report << "Projected enwik8 gain: ~" << projected_gain_kb << " KB\n";
+    fout_report.close();
+
+    std::cout << "Phase 2.75 completed. Report: " << report_file << std::endl;
+  }
+
   return 0;
 }
