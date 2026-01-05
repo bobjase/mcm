@@ -232,12 +232,39 @@ struct TransitionCost {
   int64_t delta_bits;
 };
 
+enum Regime { PROSE, LIST, TABLE, CODE, MARKUP, NUMERIC, MIXED };
+bool compatible[7][7] = {
+  {1,1,1,0,1,0,1},
+  {1,1,1,0,1,0,1},
+  {0,1,1,0,1,1,1},
+  {0,0,0,1,0,0,1},
+  {1,1,1,0,1,0,1},
+  {0,0,1,0,0,1,1},
+  {1,1,1,1,1,1,1}
+};
+struct Fingerprint {
+  std::vector<double> transition_matrix; // 144
+  std::vector<double> whitespace_hist; // 48
+  double punct_density;
+  double line_len_mean;
+};
+
 TransitionCost measure_transition_cost(const Segment& A, const Segment& B, const std::vector<uint8_t>& original, const CompressionOptions& options) {
   uint64_t A_size = A.end - A.start;
   uint64_t B_size = B.end - B.start;
 
+  // Sanity check: segments should not be too large
+  const uint64_t MAX_SEGMENT_SIZE = 1000000; // 1MB
+  if (A_size > MAX_SEGMENT_SIZE || B_size > MAX_SEGMENT_SIZE) {
+    std::cerr << "Segment size too large: A_size=" << A_size << " B_size=" << B_size << " for A" << A.id << " B" << B.id << std::endl;
+    std::exit(1);
+  }
+
+  // Use unique temp names to avoid conflicts
+  std::string suffix = "_" + std::to_string(A.id) + "_" + std::to_string(B.id);
+
   // Cold cost of B
-  std::string temp_B = "temp_B.bin";
+  std::string temp_B = "temp_B" + suffix + ".bin";
   std::ofstream fout_B(temp_B, std::ios::binary);
   fout_B.write((char*)original.data() + B.start, B_size);
   fout_B.close();
@@ -248,14 +275,16 @@ TransitionCost measure_transition_cost(const Segment& A, const Segment& B, const
   fout_comp_B.open(compressed_B.c_str(), std::ios_base::out | std::ios_base::binary);
   Archive archive_B(&fout_comp_B, options, nullptr);
   archive_B.compress(temp_files_B);
-  uint64_t size_B = fout_comp_B.tell();
   fout_comp_B.close();
-  std::remove(temp_B.c_str());
-  std::remove(compressed_B.c_str());
+  // Get size using filesystem
+  uint64_t size_B = 0;
+  if (std::filesystem::exists(compressed_B)) {
+    size_B = std::filesystem::file_size(compressed_B);
+  }
   uint64_t cold_cost_bits = size_B * 8;
 
   // Cost of A
-  std::string temp_A = "temp_A.bin";
+  std::string temp_A = "temp_A" + suffix + ".bin";
   std::ofstream fout_A(temp_A, std::ios::binary);
   fout_A.write((char*)original.data() + A.start, A_size);
   fout_A.close();
@@ -266,17 +295,20 @@ TransitionCost measure_transition_cost(const Segment& A, const Segment& B, const
   fout_comp_A.open(compressed_A.c_str(), std::ios_base::out | std::ios_base::binary);
   Archive archive_A(&fout_comp_A, options, nullptr);
   archive_A.compress(temp_files_A);
-  uint64_t size_A = fout_comp_A.tell();
   fout_comp_A.close();
-  std::remove(temp_A.c_str());
-  std::remove(compressed_A.c_str());
+  uint64_t size_A = 0;
+  if (std::filesystem::exists(compressed_A)) {
+    size_A = std::filesystem::file_size(compressed_A);
+  }
   uint64_t cost_A_bits = size_A * 8;
 
   // Cost of A + B
-  uint64_t AB_size = B.end - A.start;
-  std::string temp_AB = "temp_AB.bin";
+  uint64_t AB_start = B.start;
+  uint64_t AB_end = std::max(A.end, B.end);
+  uint64_t AB_size = AB_end - AB_start;
+  std::string temp_AB = "temp_AB" + suffix + ".bin";
   std::ofstream fout_AB(temp_AB, std::ios::binary);
-  fout_AB.write((char*)original.data() + A.start, AB_size);
+  fout_AB.write((char*)original.data() + AB_start, AB_size);
   fout_AB.close();
   FileInfo temp_info_AB(temp_AB);
   std::vector<FileInfo> temp_files_AB = {temp_info_AB};
@@ -285,22 +317,49 @@ TransitionCost measure_transition_cost(const Segment& A, const Segment& B, const
   fout_comp_AB.open(compressed_AB.c_str(), std::ios_base::out | std::ios_base::binary);
   Archive archive_AB(&fout_comp_AB, options, nullptr);
   archive_AB.compress(temp_files_AB);
-  uint64_t size_AB = fout_comp_AB.tell();
   fout_comp_AB.close();
-  std::remove(temp_AB.c_str());
-  std::remove(compressed_AB.c_str());
+  uint64_t size_AB = 0;
+  if (std::filesystem::exists(compressed_AB)) {
+    size_AB = std::filesystem::file_size(compressed_AB);
+  }
   uint64_t cost_AB_bits = size_AB * 8;
 
   // Warm cost of B: cost(A+B) - cost(A)
   uint64_t warm_cost_bits = cost_AB_bits - cost_A_bits;
 
-  // Safety check
-  if (warm_cost_bits > cold_cost_bits + 1000) { // allow some noise
-    std::cerr << "Warning: warm cost > cold cost for A" << A.id << " -> B" << B.id << std::endl;
-    // Still proceed, but log
+  // Sanity bounds
+  const uint64_t max_reasonable_bits = 8ULL * std::max(A_size, std::max(B_size, AB_size)) * 2;
+  if (cold_cost_bits < 8 || cold_cost_bits > max_reasonable_bits) {
+    std::cerr << "Cold cost out of bounds for A" << A.id << " -> B" << B.id << ": " << cold_cost_bits << std::endl;
+    return {A.id, B.id, 0, 0, 0};
+  }
+  if (cost_A_bits < 8 || cost_A_bits > max_reasonable_bits) {
+    std::cerr << "A cost out of bounds for A" << A.id << " -> B" << B.id << ": " << cost_A_bits << std::endl;
+    return {A.id, B.id, 0, 0, 0};
+  }
+  if (cost_AB_bits < 8 || cost_AB_bits > max_reasonable_bits) {
+    std::cerr << "AB cost out of bounds for A" << A.id << " -> B" << B.id << ": " << cost_AB_bits << std::endl;
+    return {A.id, B.id, 0, 0, 0};
+  }
+  if (warm_cost_bits > cold_cost_bits + 10000) {
+    std::cerr << "Warm cost suspiciously high for A" << A.id << " -> B" << B.id << ": warm=" << warm_cost_bits << " cold=" << cold_cost_bits << std::endl;
+    return {A.id, B.id, 0, 0, 0};
   }
 
   int64_t delta_bits = static_cast<int64_t>(cold_cost_bits) - static_cast<int64_t>(warm_cost_bits);
+
+  if (delta_bits < -50000 || delta_bits > 100000) {
+    std::cerr << "Delta out of bounds for A" << A.id << " -> B" << B.id << ": " << delta_bits << std::endl;
+    return {A.id, B.id, 0, 0, 0};
+  }
+
+  // Clean up temp files
+  std::remove(temp_B.c_str());
+  std::remove(compressed_B.c_str());
+  std::remove(temp_A.c_str());
+  std::remove(compressed_A.c_str());
+  std::remove(temp_AB.c_str());
+  std::remove(compressed_AB.c_str());
 
   return {A.id, B.id, cold_cost_bits, warm_cost_bits, delta_bits};
 }
@@ -1133,16 +1192,211 @@ int main(int argc, char* argv[]) {
     }
     fin_seg.close();
 
+    // Sort segments by start position
+    std::sort(segments.begin(), segments.end(), [](const auto& a, const auto& b) {
+      return std::get<0>(a) < std::get<0>(b);
+    });
+
     // Read original file
     std::ifstream fin_orig(input_file, std::ios::binary);
     std::vector<uint8_t> original((std::istreambuf_iterator<char>(fin_orig)), std::istreambuf_iterator<char>());
     fin_orig.close();
+
+    // Validate segments
+    uint64_t total_segment_size = 0;
+    for (const auto& [s, e, m, sd] : segments) {
+      if (s >= e) {
+        std::cerr << "Invalid segment: start >= end (" << s << " >= " << e << ")" << std::endl;
+        return 1;
+      }
+      total_segment_size += e - s;
+    }
+    if (total_segment_size != original.size()) {
+      std::cerr << "Segments total size " << total_segment_size << " != file size " << original.size() << std::endl;
+      return 1;
+    }
+
+    std::vector<Fingerprint> fingerprints(segments.size());
+    std::vector<Regime> regimes(segments.size());
+    // compute fingerprints and regimes
+    for (size_t i = 0; i < segments.size(); ++i) {
+      auto [s, e, m, sd] = segments[i];
+      std::string data = std::string(original.begin() + s, original.begin() + e);
+      // transition_matrix
+      std::vector<std::vector<int>> matrix(12, std::vector<int>(12, 0));
+      std::vector<std::string> tokens;
+      std::string current;
+      for (char c : data) {
+        if (isalnum(c) || c == '&' || c == '<' || c == '>' || c == '/' || c == ';') {
+          current += c;
+        } else {
+          if (!current.empty()) {
+            tokens.push_back(current);
+            current.clear();
+          }
+          if (!isspace(c) && c != '\0') {
+            tokens.push_back(std::string(1, c));
+          }
+        }
+      }
+      if (!current.empty()) tokens.push_back(current);
+      std::vector<int> classes;
+      for (auto& t : tokens) {
+        classes.push_back(Phase1Profiler::classify(t));
+      }
+      for (size_t j = 0; j + 1 < classes.size(); ++j) {
+        matrix[classes[j]][classes[j+1]]++;
+      }
+      std::vector<double> tm(144);
+      for (int r = 0; r < 12; ++r) {
+        int sum = 0;
+        for (int c = 0; c < 12; ++c) sum += matrix[r][c];
+        for (int c = 0; c < 12; ++c) {
+          tm[r*12 + c] = sum > 0 ? (double)matrix[r][c] / sum : 0;
+        }
+      }
+      fingerprints[i].transition_matrix = tm;
+      // whitespace_hist
+      std::vector<int> space_runs(16, 0);
+      std::vector<int> tab_runs(16, 0);
+      std::vector<int> newline_runs(16, 0);
+      int run = 0;
+      for (char c : data) {
+        if (c == ' ') {
+          run++;
+        } else {
+          if (run > 0) {
+            int bin = std::min(run - 1, 15);
+            space_runs[bin]++;
+            run = 0;
+          }
+        }
+      }
+      if (run > 0) space_runs[std::min(run - 1, 15)]++;
+      run = 0;
+      for (char c : data) {
+        if (c == '\t') {
+          run++;
+        } else {
+          if (run > 0) {
+            int bin = std::min(run - 1, 15);
+            tab_runs[bin]++;
+            run = 0;
+          }
+        }
+      }
+      if (run > 0) tab_runs[std::min(run - 1, 15)]++;
+      run = 0;
+      for (char c : data) {
+        if (c == '\n') {
+          run++;
+        } else {
+          if (run > 0) {
+            int bin = std::min(run - 1, 15);
+            newline_runs[bin]++;
+            run = 0;
+          }
+        }
+      }
+      if (run > 0) newline_runs[std::min(run - 1, 15)]++;
+      double total_space = 0, total_tab = 0, total_nl = 0;
+      for (int x : space_runs) total_space += x;
+      for (int x : tab_runs) total_tab += x;
+      for (int x : newline_runs) total_nl += x;
+      std::vector<double> wh(48);
+      for (int j = 0; j < 16; ++j) {
+        wh[j] = total_space > 0 ? (double)space_runs[j] / total_space : 0;
+        wh[16 + j] = total_tab > 0 ? (double)tab_runs[j] / total_tab : 0;
+        wh[32 + j] = total_nl > 0 ? (double)newline_runs[j] / total_nl : 0;
+      }
+      fingerprints[i].whitespace_hist = wh;
+      // punct_density
+      int punct_count = 0;
+      for (char c : data) if (ispunct(c)) punct_count++;
+      fingerprints[i].punct_density = (double)punct_count / data.size();
+      // line lengths
+      std::vector<size_t> line_lengths;
+      size_t start_pos = 0;
+      for (size_t j = 0; j < data.size(); ++j) {
+        if (data[j] == '\n') {
+          line_lengths.push_back(j - start_pos);
+          start_pos = j + 1;
+        }
+      }
+      if (start_pos < data.size()) line_lengths.push_back(data.size() - start_pos);
+      double mean = 0;
+      for (auto l : line_lengths) mean += l;
+      mean /= line_lengths.size();
+      fingerprints[i].line_len_mean = mean;
+      // regimes
+      int lowercase = 0, digits = 0, punct = 0, brackets = 0, delimiters = 0, newlines = 0;
+      for (char c : data) {
+        if (islower(c)) lowercase++;
+        if (isdigit(c)) digits++;
+        if (ispunct(c)) punct++;
+        if (c == '{' || c == '}' || c == '(' || c == ')' || c == '[' || c == ']') brackets++;
+        if (c == '|' || c == ':' || c == ',' || c == '<' || c == '>' || c == '/' || c == '=') delimiters++;
+        if (c == '\n') newlines++;
+      }
+      double lc_ratio = (double)lowercase / data.size();
+      double digit_ratio = (double)digits / data.size();
+      double punct_ratio = (double)punct / data.size();
+      double bracket_ratio = (double)brackets / data.size();
+      double delim_ratio = (double)delimiters / data.size();
+      double newline_rate = (double)newlines / data.size();
+      if (digit_ratio > 0.4) regimes[i] = NUMERIC;
+      else if (bracket_ratio > 0.05) regimes[i] = CODE;
+      else if (delim_ratio > 0.1) regimes[i] = TABLE;
+      else if (lc_ratio > 0.6 && punct_ratio < 0.1) regimes[i] = PROSE;
+      else if (newline_rate > 0.1) regimes[i] = LIST;
+      else if (delim_ratio > 0.05) regimes[i] = MARKUP;
+      else regimes[i] = MIXED;
+    }
+    // normalize scalars
+    double corpus_punct_mean = 0, corpus_punct_std = 0;
+    double corpus_line_mean = 0, corpus_line_std = 0;
+    for (auto& fp : fingerprints) {
+      corpus_punct_mean += fp.punct_density;
+      corpus_line_mean += fp.line_len_mean;
+    }
+    corpus_punct_mean /= fingerprints.size();
+    corpus_line_mean /= fingerprints.size();
+    for (auto& fp : fingerprints) {
+      corpus_punct_std += (fp.punct_density - corpus_punct_mean) * (fp.punct_density - corpus_punct_mean);
+      corpus_line_std += (fp.line_len_mean - corpus_line_mean) * (fp.line_len_mean - corpus_line_mean);
+    }
+    corpus_punct_std = sqrt(corpus_punct_std / fingerprints.size());
+    corpus_line_std = sqrt(corpus_line_std / fingerprints.size());
+    for (auto& fp : fingerprints) {
+      if (corpus_punct_std > 0) fp.punct_density = (fp.punct_density - corpus_punct_mean) / corpus_punct_std;
+      if (corpus_line_std > 0) fp.line_len_mean = (fp.line_len_mean - corpus_line_mean) / corpus_line_std;
+    }
+
+    // Distance function
+    auto fingerprint_distance = [](const Fingerprint& a, const Fingerprint& b) -> double {
+      double dist = 0;
+      // transition_matrix L1 with weight 1.0
+      for (size_t i = 0; i < 144; ++i) {
+        dist += std::abs(a.transition_matrix[i] - b.transition_matrix[i]);
+      }
+      // whitespace_hist L1 with weight 0.5
+      for (size_t i = 0; i < 48; ++i) {
+        dist += 0.5 * std::abs(a.whitespace_hist[i] - b.whitespace_hist[i]);
+      }
+      // punct_density L1 with weight 0.25
+      dist += 0.25 * std::abs(a.punct_density - b.punct_density);
+      // line_len_mean L1 with weight 0.25
+      dist += 0.25 * std::abs(a.line_len_mean - b.line_len_mean);
+      return dist;
+    };
 
     // Constants
     const int64_t MIN_DELTA_BITS = 4096;
     const int M = 4; // top successors per A
     const double MAX_SIZE_RATIO = 2.0;
     const double MAX_ENTROPY_DIFF = 1.0;
+
+    const int K = 32;
 
     // Disable dict
     CompressionOptions opts = options.options_;
@@ -1162,15 +1416,25 @@ int main(int argc, char* argv[]) {
       auto [a_start, a_end, a_mean, a_stddev] = segments[a_idx];
       uint64_t a_size = a_end - a_start;
 
-      // Collect candidates
+      // Collect candidates using advanced filters
       std::vector<size_t> candidates;
+      // Filter 1: fingerprint proximity (K nearest neighbors)
+      std::vector<std::pair<double, size_t>> distances;
       for (size_t b_idx = 0; b_idx < segments.size(); ++b_idx) {
         if (a_idx == b_idx) continue;
-        auto [b_start, b_end, b_mean, b_stddev] = segments[b_idx];
-        uint64_t b_size = b_end - b_start;
-        if (std::max(a_size, b_size) > MAX_SIZE_RATIO * std::min(a_size, b_size)) continue;
-        if (std::abs(a_mean - b_mean) > MAX_ENTROPY_DIFF) continue;
-        candidates.push_back(b_idx);
+        double dist = fingerprint_distance(fingerprints[a_idx], fingerprints[b_idx]);
+        distances.emplace_back(dist, b_idx);
+      }
+      std::sort(distances.begin(), distances.end());
+      std::vector<size_t> knn_candidates;
+      for (size_t i = 0; i < std::min(K, (int)distances.size()); ++i) {
+        knn_candidates.push_back(distances[i].second);
+      }
+      // Filter 2: regime compatibility
+      for (size_t b_idx : knn_candidates) {
+        if (compatible[regimes[a_idx]][regimes[b_idx]]) {
+          candidates.push_back(b_idx);
+        }
       }
 
       // Sanity check
