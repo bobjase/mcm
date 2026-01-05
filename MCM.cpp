@@ -36,6 +36,7 @@
 #include <sstream>
 #include <thread>
 #include <tuple>
+#include <map>
 
 #include "Archive.hpp"
 #include "CM.hpp"
@@ -212,6 +213,93 @@ public:
     return 0;
   }
 };
+
+struct Segment {
+  int id;
+  uint64_t start;
+  uint64_t end;
+};
+
+struct TransitionCost {
+  int A_id;
+  int B_id;
+  uint64_t cold_cost_bits;
+  uint64_t warm_cost_bits;
+  int64_t delta_bits;
+};
+
+TransitionCost measure_transition_cost(const Segment& A, const Segment& B, const std::vector<uint8_t>& original, const CompressionOptions& options) {
+  uint64_t A_size = A.end - A.start;
+  uint64_t B_size = B.end - B.start;
+
+  // Cold cost of B
+  std::string temp_B = "temp_B.bin";
+  std::ofstream fout_B(temp_B, std::ios::binary);
+  fout_B.write((char*)original.data() + B.start, B_size);
+  fout_B.close();
+  FileInfo temp_info_B(temp_B);
+  std::vector<FileInfo> temp_files_B = {temp_info_B};
+  std::string compressed_B = temp_B + ".mcm";
+  File fout_comp_B;
+  fout_comp_B.open(compressed_B.c_str(), std::ios_base::out | std::ios_base::binary);
+  Archive archive_B(&fout_comp_B, options, nullptr);
+  archive_B.compress(temp_files_B);
+  uint64_t size_B = fout_comp_B.tell();
+  fout_comp_B.close();
+  std::remove(temp_B.c_str());
+  std::remove(compressed_B.c_str());
+  uint64_t cold_cost_bits = size_B * 8;
+
+  // Cost of A
+  std::string temp_A = "temp_A.bin";
+  std::ofstream fout_A(temp_A, std::ios::binary);
+  fout_A.write((char*)original.data() + A.start, A_size);
+  fout_A.close();
+  FileInfo temp_info_A(temp_A);
+  std::vector<FileInfo> temp_files_A = {temp_info_A};
+  std::string compressed_A = temp_A + ".mcm";
+  File fout_comp_A;
+  fout_comp_A.open(compressed_A.c_str(), std::ios_base::out | std::ios_base::binary);
+  Archive archive_A(&fout_comp_A, options, nullptr);
+  archive_A.compress(temp_files_A);
+  uint64_t size_A = fout_comp_A.tell();
+  fout_comp_A.close();
+  std::remove(temp_A.c_str());
+  std::remove(compressed_A.c_str());
+  uint64_t cost_A_bits = size_A * 8;
+
+  // Cost of A + B
+  uint64_t AB_size = B.end - A.start;
+  std::string temp_AB = "temp_AB.bin";
+  std::ofstream fout_AB(temp_AB, std::ios::binary);
+  fout_AB.write((char*)original.data() + A.start, AB_size);
+  fout_AB.close();
+  FileInfo temp_info_AB(temp_AB);
+  std::vector<FileInfo> temp_files_AB = {temp_info_AB};
+  std::string compressed_AB = temp_AB + ".mcm";
+  File fout_comp_AB;
+  fout_comp_AB.open(compressed_AB.c_str(), std::ios_base::out | std::ios_base::binary);
+  Archive archive_AB(&fout_comp_AB, options, nullptr);
+  archive_AB.compress(temp_files_AB);
+  uint64_t size_AB = fout_comp_AB.tell();
+  fout_comp_AB.close();
+  std::remove(temp_AB.c_str());
+  std::remove(compressed_AB.c_str());
+  uint64_t cost_AB_bits = size_AB * 8;
+
+  // Warm cost of B: cost(A+B) - cost(A)
+  uint64_t warm_cost_bits = cost_AB_bits - cost_A_bits;
+
+  // Safety check
+  if (warm_cost_bits > cold_cost_bits + 1000) { // allow some noise
+    std::cerr << "Warning: warm cost > cold cost for A" << A.id << " -> B" << B.id << std::endl;
+    // Still proceed, but log
+  }
+
+  int64_t delta_bits = static_cast<int64_t>(cold_cost_bits) - static_cast<int64_t>(warm_cost_bits);
+
+  return {A.id, B.id, cold_cost_bits, warm_cost_bits, delta_bits};
+}
 
 int main(int argc, char* argv[]) {
   if (!kReleaseBuild) {
@@ -969,6 +1057,9 @@ int main(int argc, char* argv[]) {
     options.options_.dict_file_ = "";
     options.options_.filter_type_ = kFilterTypeNone;
 
+    // Cost cache
+    std::map<std::pair<int, int>, TransitionCost> cost_cache;
+
     // Measurements
     std::string report_file = input_file + ".phase2p75.report.txt";
     std::ofstream fout_report(report_file);
@@ -980,65 +1071,18 @@ int main(int argc, char* argv[]) {
       std::tie(id, s, e) = b;
       uint64_t len = e - s;
 
-      // Compress prefix A = original[0..s]
-      std::string temp_prefix = "temp_prefix.bin";
-      std::ofstream fout_prefix(temp_prefix, std::ios::binary);
-      fout_prefix.write((char*)original.data(), s);
-      fout_prefix.close();
-      FileInfo temp_info_prefix(temp_prefix);
-      std::vector<FileInfo> temp_files_prefix = {temp_info_prefix};
-      std::string compressed_prefix = temp_prefix + ".mcm";
-      File fout_comp_prefix;
-      fout_comp_prefix.open(compressed_prefix.c_str(), std::ios_base::out | std::ios_base::binary);
-      Archive archive_prefix(&fout_comp_prefix, options.options_, nullptr);
-      archive_prefix.compress(temp_files_prefix);
-      uint64_t size_prefix = fout_comp_prefix.tell();
-      fout_comp_prefix.close();
-      std::remove(temp_prefix.c_str());
-      std::remove(compressed_prefix.c_str());
+      Segment A {-1, 0, s};
+      Segment B {id, s, e};
+      auto key = std::make_pair(A.id, B.id);
+      TransitionCost cost;
+      if (cost_cache.count(key)) {
+        cost = cost_cache[key];
+      } else {
+        cost = measure_transition_cost(A, B, original, options.options_);
+        cost_cache[key] = cost;
+      }
 
-      // Compress A + B = original[0..e]
-      std::string temp_AB = "temp_AB.bin";
-      std::ofstream fout_AB(temp_AB, std::ios::binary);
-      fout_AB.write((char*)original.data(), e);
-      fout_AB.close();
-      FileInfo temp_info_AB(temp_AB);
-      std::vector<FileInfo> temp_files_AB = {temp_info_AB};
-      std::string compressed_AB = temp_AB + ".mcm";
-      File fout_comp_AB;
-      fout_comp_AB.open(compressed_AB.c_str(), std::ios_base::out | std::ios_base::binary);
-      Archive archive_AB(&fout_comp_AB, options.options_, nullptr);
-      archive_AB.compress(temp_files_AB);
-      uint64_t size_AB = fout_comp_AB.tell();
-      fout_comp_AB.close();
-      std::remove(temp_AB.c_str());
-      std::remove(compressed_AB.c_str());
-
-      // Warm cost of B: cost(A+B) - cost(A)
-      double warm_cost_B = (static_cast<double>(size_AB) - size_prefix) * 8;
-
-      // Compress only B = original[s..e]
-      std::string temp_B = "temp_B.bin";
-      std::ofstream fout_B(temp_B, std::ios::binary);
-      fout_B.write((char*)original.data() + s, len);
-      fout_B.close();
-      FileInfo temp_info_B(temp_B);
-      std::vector<FileInfo> temp_files_B = {temp_info_B};
-      std::string compressed_B = temp_B + ".mcm";
-      File fout_comp_B;
-      fout_comp_B.open(compressed_B.c_str(), std::ios_base::out | std::ios_base::binary);
-      Archive archive_B(&fout_comp_B, options.options_, nullptr);
-      archive_B.compress(temp_files_B);
-      uint64_t size_B = fout_comp_B.tell();
-      fout_comp_B.close();
-      std::remove(temp_B.c_str());
-      std::remove(compressed_B.c_str());
-
-      // Cold cost of B: cost(B)
-      double cold_cost_B = static_cast<double>(size_B) * 8;
-
-      // Delta: cold - warm (positive means headroom)
-      double delta = cold_cost_B - warm_cost_B;
+      double delta = cost.delta_bits;
       if (delta > 0) {
         total_avoidable_bits += delta;
         total_measured_bytes += len;
@@ -1047,8 +1091,8 @@ int main(int argc, char* argv[]) {
       fout_report << "Block " << id << ":\n";
       fout_report << "  Prefix size: " << s << " bytes\n";
       fout_report << "  Block size: " << len << " bytes\n";
-      fout_report << "  Cold compressed size: " << len << " -> " << size_B << " bytes (" << cold_cost_B << " bits)\n";
-      fout_report << "  Warm compressed size: " << len << " -> " << (size_AB - size_prefix) << " bytes (" << warm_cost_B << " bits)\n";
+      fout_report << "  Cold compressed size: " << len << " -> " << (cost.cold_cost_bits / 8) << " bytes (" << cost.cold_cost_bits << " bits)\n";
+      fout_report << "  Warm compressed size: " << len << " -> " << (cost.warm_cost_bits / 8) << " bytes (" << cost.warm_cost_bits << " bits)\n";
       fout_report << "  Delta: " << delta << " bits\n\n";
     }
 
