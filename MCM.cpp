@@ -29,6 +29,8 @@
 #include <string.h>
 #include <string>
 #include <vector>
+#include <filesystem>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -116,6 +118,8 @@ public:
   std::vector<FileInfo> files;
   std::string dict_file;
   bool phase1_profile = false;
+  bool phase1_dump_csv = false;
+  bool phase2p5_profile = false;
   bool phase2p75_measure = false;
 
   // int usage(const std::string& name) {
@@ -912,9 +916,9 @@ int main(int argc, char* argv[]) {
     std::cout << "Phase 2.5 completed successfully" << std::endl;
   }
 
-  // Phase 2.75 headroom measurement
+  // Phase 2.75 empirical reordering validation
   if (options.phase2p75_measure) {
-    std::cout << "Starting Phase 2.75 headroom measurement" << std::endl;
+    std::cout << "Starting Phase 2.75 empirical reordering validation" << std::endl;
     std::string input_file = options.files[0].name();
     std::string segments_file = input_file + ".phase2.segments.txt";
     std::ifstream fin_seg(segments_file);
@@ -937,18 +941,19 @@ int main(int argc, char* argv[]) {
 
     // Select blocks: size >=64KB, variance <=0.01, not within 8KB of cuts, within first 5MB
     const uint64_t min_size = 65536;
-    const double max_variance = 0.01;
+    const double max_variance = 0.1;
     const uint64_t margin = 8192;
     const uint64_t max_offset = 5242880; // 5MB
     std::vector<std::tuple<int, uint64_t, uint64_t>> selected_blocks;
     for (size_t i = 0; i < segments.size(); ++i) {
-      auto [s, e, m, v] = segments[i];
+      auto [s, e, m, stddev] = segments[i];
       uint64_t len = e - s;
-      if (len >= min_size && v <= max_variance && s >= margin && e <= original.size() - margin && e <= max_offset) {
+      double variance = stddev * stddev;
+      if (len >= min_size && variance <= max_variance && s >= margin && e <= original.size() - margin && e <= max_offset) {
         selected_blocks.emplace_back(i, s, e);
       }
     }
-    if (selected_blocks.size() > 40) selected_blocks.resize(40); // limit to 40
+    if (selected_blocks.size() > 10) selected_blocks.resize(10); // limit to 10 for speed
 
     // Output selected blocks
     std::string blocks_file = input_file + ".phase2p75.blocks.txt";
@@ -960,67 +965,91 @@ int main(int argc, char* argv[]) {
     }
     fout_blocks.close();
 
+    // Compress original with no dictionary
+    options.options_.dict_file_ = "";
+    options.options_.filter_type_ = kFilterTypeNone;
+
     // Measurements
     std::string report_file = input_file + ".phase2p75.report.txt";
     std::ofstream fout_report(report_file);
     double total_avoidable_bits = 0;
     uint64_t total_measured_bytes = 0;
+
     for (auto& b : selected_blocks) {
       int id; uint64_t s, e;
       std::tie(id, s, e) = b;
       uint64_t len = e - s;
-      std::vector<uint8_t> block(original.begin() + s, original.begin() + e);
 
-      // Cold cost
-      std::vector<double> costs;
-      Range7::observer_costs = &costs;
-      costs.clear();
-      std::string temp_file = "temp_block.bin";
-      std::ofstream fout_temp(temp_file, std::ios::binary);
-      fout_temp.write((char*)block.data(), block.size());
-      fout_temp.close();
-      FileInfo temp_info(temp_file);
-      std::vector<FileInfo> temp_files = {temp_info};
-      VoidWriteStream vws;
-      Archive archive(&vws, options.options_, nullptr);
-      archive.compress(temp_files);
-      Range7::observer_costs = nullptr;
-      double cold_cost = std::accumulate(costs.begin(), costs.end(), 0.0);
-      std::remove(temp_file.c_str());
+      // Compress prefix A = original[0..s]
+      std::string temp_prefix = "temp_prefix.bin";
+      std::ofstream fout_prefix(temp_prefix, std::ios::binary);
+      fout_prefix.write((char*)original.data(), s);
+      fout_prefix.close();
+      FileInfo temp_info_prefix(temp_prefix);
+      std::vector<FileInfo> temp_files_prefix = {temp_info_prefix};
+      std::string compressed_prefix = temp_prefix + ".mcm";
+      File fout_comp_prefix;
+      fout_comp_prefix.open(compressed_prefix.c_str(), std::ios_base::out | std::ios_base::binary);
+      Archive archive_prefix(&fout_comp_prefix, options.options_, nullptr);
+      archive_prefix.compress(temp_files_prefix);
+      uint64_t size_prefix = fout_comp_prefix.tell();
+      fout_comp_prefix.close();
+      std::remove(temp_prefix.c_str());
+      std::remove(compressed_prefix.c_str());
 
-      // Warm cost
-      uint64_t warm_start = (s >= 262144) ? s - 262144 : 0; // 256KB
-      uint64_t warm_len = s - warm_start;
-      if (warm_len >= 65536) {
-        std::vector<uint8_t> warm_block(original.begin() + warm_start, original.begin() + s);
-        std::vector<uint8_t> combined = warm_block;
-        combined.insert(combined.end(), block.begin(), block.end());
+      // Compress A + B = original[0..e]
+      std::string temp_AB = "temp_AB.bin";
+      std::ofstream fout_AB(temp_AB, std::ios::binary);
+      fout_AB.write((char*)original.data(), e);
+      fout_AB.close();
+      FileInfo temp_info_AB(temp_AB);
+      std::vector<FileInfo> temp_files_AB = {temp_info_AB};
+      std::string compressed_AB = temp_AB + ".mcm";
+      File fout_comp_AB;
+      fout_comp_AB.open(compressed_AB.c_str(), std::ios_base::out | std::ios_base::binary);
+      Archive archive_AB(&fout_comp_AB, options.options_, nullptr);
+      archive_AB.compress(temp_files_AB);
+      uint64_t size_AB = fout_comp_AB.tell();
+      fout_comp_AB.close();
+      std::remove(temp_AB.c_str());
+      std::remove(compressed_AB.c_str());
 
-        costs.clear();
-        Range7::observer_costs = &costs;
-        std::string temp_file2 = "temp_combined.bin";
-        std::ofstream fout_temp2(temp_file2, std::ios::binary);
-        fout_temp2.write((char*)combined.data(), combined.size());
-        fout_temp2.close();
-        FileInfo temp_info2(temp_file2);
-        std::vector<FileInfo> temp_files2 = {temp_info2};
-        VoidWriteStream vws2;
-        Archive archive2(&vws2, options.options_, nullptr);
-        archive2.compress(temp_files2);
-        Range7::observer_costs = nullptr;
-        double warm_cost = std::accumulate(costs.begin() + warm_len, costs.end(), 0.0);
-        std::remove(temp_file2.c_str());
+      // Warm cost of B: cost(A+B) - cost(A)
+      double warm_cost_B = (static_cast<double>(size_AB) - size_prefix) * 8;
 
-        double delta = cold_cost - warm_cost;
+      // Compress only B = original[s..e]
+      std::string temp_B = "temp_B.bin";
+      std::ofstream fout_B(temp_B, std::ios::binary);
+      fout_B.write((char*)original.data() + s, len);
+      fout_B.close();
+      FileInfo temp_info_B(temp_B);
+      std::vector<FileInfo> temp_files_B = {temp_info_B};
+      std::string compressed_B = temp_B + ".mcm";
+      File fout_comp_B;
+      fout_comp_B.open(compressed_B.c_str(), std::ios_base::out | std::ios_base::binary);
+      Archive archive_B(&fout_comp_B, options.options_, nullptr);
+      archive_B.compress(temp_files_B);
+      uint64_t size_B = fout_comp_B.tell();
+      fout_comp_B.close();
+      std::remove(temp_B.c_str());
+      std::remove(compressed_B.c_str());
+
+      // Cold cost of B: cost(B)
+      double cold_cost_B = static_cast<double>(size_B) * 8;
+
+      // Delta: cold - warm (positive means headroom)
+      double delta = cold_cost_B - warm_cost_B;
+      if (delta > 0) {
         total_avoidable_bits += delta;
         total_measured_bytes += len;
-
-        fout_report << "Block " << id << ":\n";
-        fout_report << "  Size: " << len << " bytes\n";
-        fout_report << "  Cold cost: " << cold_cost << " bits\n";
-        fout_report << "  Warm cost: " << warm_cost << " bits\n";
-        fout_report << "  Delta: " << delta << " bits (" << (delta / cold_cost * 100) << "%)\n\n";
       }
+
+      fout_report << "Block " << id << ":\n";
+      fout_report << "  Prefix size: " << s << " bytes\n";
+      fout_report << "  Block size: " << len << " bytes\n";
+      fout_report << "  Cold compressed size: " << len << " -> " << size_B << " bytes (" << cold_cost_B << " bits)\n";
+      fout_report << "  Warm compressed size: " << len << " -> " << (size_AB - size_prefix) << " bytes (" << warm_cost_B << " bits)\n";
+      fout_report << "  Delta: " << delta << " bits\n\n";
     }
 
     double avoidable_per_mb = total_avoidable_bits / total_measured_bytes * 1000000;

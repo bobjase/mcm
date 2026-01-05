@@ -32,6 +32,8 @@
 #include <vector>
 #include <cmath>
 
+inline std::vector<double>* observer_costs_global = nullptr;
+
 // From 7zip, added single bit functions
 class Range7 {
 private:
@@ -41,8 +43,6 @@ private:
   uint64_t Low = 0;
   uint8_t _cache = 0;
   std::function<void(double)> entropy_callback_;
-
-  static std::vector<double>* observer_costs;
 
   template <typename TOut>
   ALWAYS_INLINE void shiftLow(TOut& sout) { //Emit the top byte 
@@ -59,7 +59,7 @@ private:
   }
 public:
   void setEntropyCallback(std::function<void(double)> cb) { entropy_callback_ = cb; }
-  static void setObserver(std::vector<double>* costs) { observer_costs = costs; }
+  static void setObserver(std::vector<double>* costs) { observer_costs_global = costs; }
   template <typename TOut>
   ALWAYS_INLINE void IncreaseRange(TOut& out) {
     while (Range < TopValue) {
@@ -96,6 +96,11 @@ public:
       double prob = static_cast<double>(p) / (1 << shift);
       double e = bit ? -log2(prob + 1e-12) : -log2(1 - prob + 1e-12);
       entropy_callback_(e);
+    }
+    if (observer_costs_global) {
+      double prob = static_cast<double>(p) / (1 << shift);
+      double e = bit ? -log2(prob + 1e-12) : -log2(1 - prob + 1e-12);
+      observer_costs_global->push_back(e);
     }
   }
 
@@ -178,9 +183,9 @@ public:
     assert(size > 0);
     assert(start < total);
     assert(start + size <= total);
-    if (observer_costs) {
+    if (observer_costs_global) {
       double p = static_cast<double>(size) / total;
-      observer_costs->push_back(-log2(p));
+      observer_costs_global->push_back(-log2(p));
     }
     Range /= total;
     Low += start * Range;
@@ -253,7 +258,5 @@ public:
     }
   }
 };
-
-inline std::vector<double>* Range7::observer_costs = nullptr;
 
 #endif
