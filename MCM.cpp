@@ -37,6 +37,7 @@
 #include <thread>
 #include <tuple>
 #include <map>
+#include <set>
 
 #include "Archive.hpp"
 #include "CM.hpp"
@@ -122,6 +123,7 @@ public:
   bool phase1_dump_csv = false;
   bool phase2p5_profile = false;
   bool phase2p75_measure = false;
+  bool phase3_build_graph = false;
 
   // int usage(const std::string& name) {
   //   printHeader();
@@ -162,6 +164,8 @@ public:
         mode = kModeCompress;
       } else if (arg == "--phase2p75-measure-headroom") {
         phase2p75_measure = true;
+      } else if (arg == "--phase3-build-graph") {
+        phase3_build_graph = true;
       } else if (arg == "d") {
         mode = kModeDecompress;
       } else if (arg == "-test") {
@@ -201,7 +205,7 @@ public:
     if (mode == kModeUnknown) {
       mode = kModeCompress;
     }
-    if (files.empty() && !phase1_profile && !phase1_dump_csv && !phase2p5_profile && !phase2p75_measure) {
+    if (files.empty() && !phase1_profile && !phase1_dump_csv && !phase2p5_profile && !phase2p75_measure && !phase3_build_graph) {
       printUsage(program);
       return 0;
     }
@@ -575,10 +579,10 @@ int main(int argc, char* argv[]) {
           }
           // Coarseness
           double coarseness = (mean_entropy > 0) ? stddev_delta / mean_entropy : 0;
-          // Spikes for k=2.5
+          // Spikes for k=2.0
           std::vector<size_t> spike_positions;
           for (size_t i = 0; i < deltas.size(); ++i) {
-            if (deltas[i] > mean_delta + 2.5 * stddev_delta) {
+            if (deltas[i] > mean_delta + 2.0 * stddev_delta) {
               spike_positions.push_back(i);
             }
           }
@@ -592,9 +596,10 @@ int main(int argc, char* argv[]) {
             double mean_spike_dist = total_dist / (spike_positions.size() - 1);
             target_segment_size = static_cast<int>(mean_spike_dist * 1024); // stride
           }
-          int min_segment_size = target_segment_size / 4;
-          int max_segment_size = (coarseness < 0.5) ? target_segment_size * 8 : target_segment_size * 2;
-          double entropy_threshold = mean_delta + 2.5 * stddev_delta;
+          target_segment_size /= 6; // reduce by 6x for finer segmentation
+          int min_segment_size = 4096;
+          int max_segment_size = 65536;
+          double entropy_threshold = mean_delta + 2.0 * stddev_delta;
           // Token class stats
           const int num_classes = 12;
           int transition_matrix[12][12];
@@ -1108,6 +1113,199 @@ int main(int argc, char* argv[]) {
     fout_report.close();
 
     std::cout << "Phase 2.75 completed. Report: " << report_file << std::endl;
+  }
+
+  // Phase 3.0: Build transition graph
+  if (options.phase3_build_graph) {
+    std::cout << "Starting Phase 3.0: Build transition graph" << std::endl;
+    std::string input_file = options.files[0].name();
+    std::string segments_file = input_file + ".phase2.segments.txt";
+    std::ifstream fin_seg(segments_file);
+    if (!fin_seg) {
+      std::cerr << "Cannot open " << segments_file << std::endl;
+      return 1;
+    }
+    std::vector<std::tuple<uint64_t, uint64_t, double, double>> segments;
+    uint64_t start, end;
+    double mean, stddev;
+    while (fin_seg >> start >> end >> mean >> stddev) {
+      segments.emplace_back(start, end, mean, stddev);
+    }
+    fin_seg.close();
+
+    // Read original file
+    std::ifstream fin_orig(input_file, std::ios::binary);
+    std::vector<uint8_t> original((std::istreambuf_iterator<char>(fin_orig)), std::istreambuf_iterator<char>());
+    fin_orig.close();
+
+    // Constants
+    const int64_t MIN_DELTA_BITS = 4096;
+    const int M = 4; // top successors per A
+    const double MAX_SIZE_RATIO = 2.0;
+    const double MAX_ENTROPY_DIFF = 1.0;
+
+    // Disable dict
+    CompressionOptions opts = options.options_;
+    opts.dict_file_ = "";
+    opts.filter_type_ = kFilterTypeNone;
+
+    // Cache for oracle
+    std::map<std::pair<int, int>, TransitionCost> cost_cache;
+
+    // Transitions: list of {A_id, B_id, delta_bits, warm_bits, cold_bits}
+    std::vector<std::tuple<int, int, int64_t, uint64_t, uint64_t>> transitions;
+
+    // For each A
+    int num_oracle_calls = 0;
+    int num_valid_transitions = 0;
+    for (size_t a_idx = 0; a_idx < segments.size(); ++a_idx) {
+      auto [a_start, a_end, a_mean, a_stddev] = segments[a_idx];
+      uint64_t a_size = a_end - a_start;
+
+      // Collect candidates
+      std::vector<size_t> candidates;
+      for (size_t b_idx = 0; b_idx < segments.size(); ++b_idx) {
+        if (a_idx == b_idx) continue;
+        auto [b_start, b_end, b_mean, b_stddev] = segments[b_idx];
+        uint64_t b_size = b_end - b_start;
+        if (std::max(a_size, b_size) > MAX_SIZE_RATIO * std::min(a_size, b_size)) continue;
+        if (std::abs(a_mean - b_mean) > MAX_ENTROPY_DIFF) continue;
+        candidates.push_back(b_idx);
+      }
+
+      // Sanity check
+      if (candidates.empty()) {
+        std::cerr << "No candidates for A " << a_idx << std::endl;
+        return 1;
+      }
+
+      // Evaluate with oracle
+      std::vector<std::tuple<int64_t, size_t, TransitionCost>> valid_bs;
+      for (size_t b_idx : candidates) {
+        auto [b_start, b_end, b_mean, b_stddev] = segments[b_idx];
+        Segment A_seg {static_cast<int>(a_idx), a_start, a_end};
+        Segment B_seg {static_cast<int>(b_idx), b_start, b_end};
+        auto key = std::make_pair(A_seg.id, B_seg.id);
+        TransitionCost cost;
+        if (cost_cache.count(key)) {
+          cost = cost_cache[key];
+        } else {
+          cost = measure_transition_cost(A_seg, B_seg, original, opts);
+          cost_cache[key] = cost;
+          ++num_oracle_calls;
+        }
+        if (cost.delta_bits > MIN_DELTA_BITS) {
+          valid_bs.emplace_back(cost.delta_bits, b_idx, cost);
+        }
+      }
+
+      // Sort by delta DESC
+      std::sort(valid_bs.begin(), valid_bs.end(), [](const auto& a, const auto& b) {
+        return std::get<0>(a) > std::get<0>(b); // delta DESC
+      });
+
+      // Keep top M
+      for (size_t i = 0; i < std::min(M, (int)valid_bs.size()); ++i) {
+        auto [delta, b_idx, cost] = valid_bs[i];
+        transitions.emplace_back(a_idx, b_idx, delta, cost.warm_cost_bits, cost.cold_cost_bits);
+        ++num_valid_transitions;
+      }
+    }
+
+    // Sanity checks
+    int negative_deltas = 0;
+    for (auto& [a, b, d, w, c] : transitions) {
+      if (d < 0) ++negative_deltas;
+    }
+    if (negative_deltas > 0.05 * num_oracle_calls) {
+      std::cerr << "Too many negative deltas: " << negative_deltas << "/" << num_oracle_calls << std::endl;
+      return 1;
+    }
+
+    // Build reverse map for conflicts
+    std::map<int, std::vector<std::tuple<int64_t, int>>> b_to_as;
+    for (auto& [a, b, d, w, c] : transitions) {
+      b_to_as[b].emplace_back(d, a);
+    }
+
+    // Conflicts
+    std::vector<std::tuple<int, int, std::vector<int>>> conflicts;
+    for (auto& [b, as_list] : b_to_as) {
+      if (as_list.size() > 1) {
+        std::sort(as_list.begin(), as_list.end(), [](const auto& a, const auto& b) {
+          return std::get<0>(a) > std::get<0>(b); // delta DESC
+        });
+        int winning_a = std::get<1>(as_list[0]);
+        std::vector<int> losing_as;
+        for (size_t i = 1; i < as_list.size(); ++i) {
+          losing_as.push_back(std::get<1>(as_list[i]));
+        }
+        conflicts.emplace_back(b, winning_a, losing_as);
+      }
+    }
+
+    // Output phase3.transitions.json
+    std::string transitions_file = input_file + ".phase3.transitions.json";
+    std::ofstream fout_trans(transitions_file);
+    fout_trans << "[\n";
+    for (size_t i = 0; i < transitions.size(); ++i) {
+      auto [a, b, d, w, c] = transitions[i];
+      fout_trans << "  {\"A_id\": " << a << ", \"B_id\": " << b << ", \"delta_bits\": " << d << ", \"warm_bits\": " << w << ", \"cold_bits\": " << c << "}";
+      if (i < transitions.size() - 1) fout_trans << ",";
+      fout_trans << "\n";
+    }
+    fout_trans << "]\n";
+    fout_trans.close();
+
+    // Output phase3.conflicts.json
+    std::string conflicts_file = input_file + ".phase3.conflicts.json";
+    std::ofstream fout_conf(conflicts_file);
+    fout_conf << "[\n";
+    for (size_t i = 0; i < conflicts.size(); ++i) {
+      auto [b, win_a, lose_as] = conflicts[i];
+      fout_conf << "  {\"B_id\": " << b << ", \"winning_A\": " << win_a << ", \"losing_As\": [";
+      for (size_t j = 0; j < lose_as.size(); ++j) {
+        fout_conf << lose_as[j];
+        if (j < lose_as.size() - 1) fout_conf << ",";
+      }
+      fout_conf << "]}";
+      if (i < conflicts.size() - 1) fout_conf << ",";
+      fout_conf << "\n";
+    }
+    fout_conf << "]\n";
+    fout_conf.close();
+
+    // Summary stats
+    std::vector<int64_t> deltas;
+    for (auto& [a, b, d, w, c] : transitions) deltas.push_back(d);
+    double avg_delta = 0;
+    if (!deltas.empty()) {
+      for (auto d : deltas) avg_delta += d;
+      avg_delta /= deltas.size();
+    }
+    int64_t max_delta = deltas.empty() ? 0 : *std::max_element(deltas.begin(), deltas.end());
+
+    // Max chain length (simple estimate, ignoring conflicts)
+    std::set<int> all_nodes;
+    for (auto& [a, b, d, w, c] : transitions) {
+      all_nodes.insert(a);
+      all_nodes.insert(b);
+    }
+    int max_chain = 0; // stub, hard to compute without graph analysis
+
+    std::string summary_file = input_file + ".phase3.summary.json";
+    std::ofstream fout_sum(summary_file);
+    fout_sum << "{\n";
+    fout_sum << "  \"num_segments\": " << segments.size() << ",\n";
+    fout_sum << "  \"num_oracle_calls\": " << num_oracle_calls << ",\n";
+    fout_sum << "  \"num_valid_transitions\": " << num_valid_transitions << ",\n";
+    fout_sum << "  \"avg_delta_bits\": " << avg_delta << ",\n";
+    fout_sum << "  \"max_delta_bits\": " << max_delta << ",\n";
+    fout_sum << "  \"max_chain_length\": " << max_chain << "\n";
+    fout_sum << "}\n";
+    fout_sum.close();
+
+    std::cout << "Phase 3.0 completed. Transitions: " << transitions_file << ", Conflicts: " << conflicts_file << ", Summary: " << summary_file << std::endl;
   }
 
   return 0;
